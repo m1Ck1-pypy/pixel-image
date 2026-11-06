@@ -1,0 +1,8 @@
+[package]
+name = "pixel-image-core"
+version.workspace = true
+edition.workspace = true
+description = "Image pipeline: pixel-art conversion and background cutout"
+
+[dependencies]
+image.workspace = true

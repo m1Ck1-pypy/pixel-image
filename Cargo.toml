@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/cli", "crates/gui", "crates/gui/ui"]
+
+[workspace.package]
+version = "0.8.0"
+edition = "2024"
+
+[workspace.dependencies]
+pixel-image-core = { path = "crates/core", version = "0.8.0" }
+pixel-image-ui = { path = "crates/gui/ui", version = "0.8.0" }
+clap = { version = "4.6.7", features = ["derive"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }
+anyhow = "1.0.104"
+pixels = "0.17.2"
+rfd = "0.17.2"
+winit = "0.30.13"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

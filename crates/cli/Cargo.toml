@@ -1,0 +1,13 @@
+[package]
+name = "pixel-image-cli"
+version.workspace = true
+edition.workspace = true
+description = "Command-line interface for pixel-image"
+
+[[bin]]
+name = "pixel-image"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+pixel-image-core.workspace = true

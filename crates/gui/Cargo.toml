@@ -1,0 +1,20 @@
+[package]
+name = "pixel-image-gui"
+version.workspace = true
+edition.workspace = true
+description = "Desktop GUI for pixel-image"
+
+[[bin]]
+name = "pixel-image-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+image.workspace = true
+pixel-image-core.workspace = true
+pixel-image-ui.workspace = true
+pixels.workspace = true
+rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+winit.workspace = true
