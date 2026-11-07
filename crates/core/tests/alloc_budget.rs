@@ -210,6 +210,49 @@ fn cutout_allocation_budget() {
     );
 }
 
+/// Полосный ресэмплер без буферов `pre 3 + al 1` на весь исходник: на
+/// 24 Мп-подобном входе (2000×1500) дополнительная память — только выход, две
+/// таблицы весов и строка-аккумулятор, а не ещё один полный RGBA-буфер.
+///
+/// Меряем именно уменьшение, а не весь `convert_image`: на сетке 128×96
+/// гистограмма и median cut аллоцируют больше самого фильтра, и замок на
+/// ресэмплер в общем бюджете не был бы виден.
+#[test]
+fn resize_allocation_budget() {
+    let _guard = serial();
+    let src = fixture(2000, 1500, 13);
+
+    // Замер на пуле из одного потока: иначе в пик попадают строки-аккумуляторы
+    // всех потоков (`O(w × threads)`), а тест стал бы зависеть от числа ядер.
+    // Сам пул создаём до замера.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("пул из одного потока");
+    pool.install(|| {});
+
+    let (sprite, budget) = measure(|| {
+        pool.install(|| {
+            pixel_image_core::Filter::Lanczos.downscale(&src, 128, 96, pixel_image_core::FAINT_ALPHA)
+        })
+    });
+    println!("resize_2000x1500: {budget:?}");
+
+    assert_eq!(sprite.dimensions(), (128, 96));
+    assert!(
+        budget.peak_bytes <= RESIZE_PEAK_KIB * 1024,
+        "пик {} КиБ при бюджете {} КиБ: {budget:?}",
+        kib(budget.peak_bytes),
+        RESIZE_PEAK_KIB
+    );
+    assert!(
+        budget.allocs <= RESIZE_ALLOCS,
+        "аллокаций {} при бюджете {}: {budget:?}",
+        budget.allocs,
+        RESIZE_ALLOCS
+    );
+}
+
 // Значения сняты на текущей реализации (этап 0) и держатся намеренно плотно:
 // это замок регрессии, а не запас. Любая лишняя аллокация обязана его уронить,
 // поэтому при осознанном улучшении числа уменьшают (этапы 2, 4, 5 плана),
@@ -219,9 +262,19 @@ fn cutout_allocation_budget() {
 // Этап 2 убрал из `convert_image` растр сетки (2048×2048×4), поэтому пик
 // pixel-art упал с ~16 500 КиБ до ~833 КиБ: остались исходник, премультиплай
 // и спрайт. Cutout пока не трогали — там копия исходника обязательна.
-const PIXEL_ART_ALLOCS: usize = 132;
-const PIXEL_ART_REALLOCS: usize = 37;
-const PIXEL_ART_PEAK_KIB: usize = 900;
+//
+// Этап 4 (полосный ресэмплер) убрал буферы `pre 3 Б/пиксель` и `al 1 Б/пиксель`,
+// поэтому пик pixel-art упал ещё ниже (833 -> 512 КиБ), а аллокаций стало на 11
+// меньше: вместо двух полных изображений остались только выход, таблицы весов и
+// одна строка-аккумулятор f32.
+//
+// Замок на сам ресэмплер (2000×1500 -> 128×96, один поток): 8 аллокаций и 165 КиБ
+// вместо ~15 МБ у старого пути (`pre` 9 МБ + `al` 3 МБ + f32-промежуток `image`).
+const PIXEL_ART_ALLOCS: usize = 121;
+const PIXEL_ART_REALLOCS: usize = 29;
+const PIXEL_ART_PEAK_KIB: usize = 513;
 const CUTOUT_ALLOCS: usize = 50;
 const CUTOUT_REALLOCS: usize = 40;
 const CUTOUT_PEAK_KIB: usize = 1_700;
+const RESIZE_PEAK_KIB: usize = 170;
+const RESIZE_ALLOCS: usize = 8;

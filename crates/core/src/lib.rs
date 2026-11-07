@@ -21,6 +21,7 @@ pub mod grid;
 pub mod palette;
 pub mod parallel;
 pub mod pipeline;
+pub mod resize;
 
 pub use color::Color;
 pub use downscale::Filter;

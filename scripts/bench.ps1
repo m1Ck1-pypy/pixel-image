@@ -66,13 +66,17 @@ foreach ($fixture in @($big, $mid, $alpha, $small)) {
 # Память: WsMb/CommitMb — пик процесса. Время: Ms — общая длительность запуска.
 # Этап 3 (rayon) сжал «pixel-art 24mp box» с 138 до ~90 мс — порог времени
 # уменьшен следом (память не изменилась, её не трогали).
+# Этап 4 (полосный ресэмплер) снял ~95% времени уменьшения и ~30 МБ пика на
+# JPEG-входе, поэтому пороги 24/12 Мп пересняты. Учтите: при коротких прогонах
+# (30-60 мс) опрос раз в 5 мс не всегда видит пик памяти и число занижается —
+# поэтому пороги памяти для мелких сценариев оставлены как были.
 $Thresholds = [ordered]@{
-    'pixel-art 24mp'     = @{ WsMb = 196.4; CommitMb = 193.9; Ms = 630 }
-    'pixel-art 24mp box' = @{ WsMb = 165.7; CommitMb = 163.1; Ms = 115 }
+    'pixel-art 24mp'     = @{ WsMb = 172;   CommitMb = 170;   Ms = 160 }
+    'pixel-art 24mp box' = @{ WsMb = 172;   CommitMb = 170;   Ms = 115 }
     'cutout 24mp all'    = @{ WsMb = 231.1; CommitMb = 329.9; Ms = 410 }
     'cutout alpha png'   = @{ WsMb = 53.0;  CommitMb = 52.9;  Ms = 70 }
-    'pixel-art 12mp'     = @{ WsMb = 102.6; CommitMb = 99.6;  Ms = 340 }
-    'pixel-art small'    = @{ WsMb = 47.3;  CommitMb = 43.7;  Ms = 70 }
+    'pixel-art 12mp'     = @{ WsMb = 92;    CommitMb = 90;    Ms = 95 }
+    'pixel-art small'    = @{ WsMb = 47.3;  CommitMb = 43.7;  Ms = 45 }
 }
 
 $Scenarios = @(

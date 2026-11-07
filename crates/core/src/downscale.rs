@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
-use image::{GrayImage, RgbImage, RgbaImage, imageops::FilterType};
+use image::RgbaImage;
 use rayon::prelude::*;
 
 use crate::color::Color;
 use crate::parallel;
+use crate::resize::{self, Kernel};
 
 /// Способ уменьшения изображения до сетки.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,73 +35,36 @@ impl Filter {
     /// (мягкая маска от JPEG-сглаживания). Так исходник не нужно копировать и
     /// чистить перед уменьшением: фильтр сам не берёт их в расчёт.
     pub fn downscale(&self, src: &RgbaImage, gw: u32, gh: u32, faint: u8) -> RgbaImage {
-        let ft = match *self {
-            Filter::Lanczos => FilterType::Lanczos3,
-            Filter::Catmull => FilterType::CatmullRom,
-            Filter::Triangle => FilterType::Triangle,
-            Filter::Gaussian => FilterType::Gaussian,
-            Filter::Nearest => FilterType::Nearest,
-            Filter::Box => return downscale_blocks(src, gw, gh, false, faint),
-            Filter::Mode => return downscale_blocks(src, gw, gh, true, faint),
-        };
-        downscale_resize(src, gw, gh, ft, faint)
+        match *self {
+            Filter::Box => downscale_blocks(src, gw, gh, false, faint),
+            Filter::Mode => downscale_blocks(src, gw, gh, true, faint),
+            _ => resize::resize_premultiplied(
+                src,
+                gw,
+                gh,
+                self.kernel().expect("у фильтра есть ядро"),
+                faint,
+            ),
+        }
+    }
+
+    /// Ядро разделимого ресэмплера; `None` у блочных фильтров, которые считаются
+    /// не свёрткой, а средним/модой по блоку.
+    pub(crate) fn kernel(&self) -> Option<Kernel> {
+        match self {
+            Filter::Lanczos => Some(Kernel::Lanczos3),
+            Filter::Catmull => Some(Kernel::CatmullRom),
+            Filter::Triangle => Some(Kernel::Triangle),
+            Filter::Gaussian => Some(Kernel::Gaussian),
+            Filter::Nearest => Some(Kernel::Nearest),
+            Filter::Box | Filter::Mode => None,
+        }
     }
 }
 
 /// Альфа с отсечением мягкой маски: `0 < a < faint` -> 0.
-#[inline]
 fn clean_alpha(a: u8, faint: u8) -> u8 {
-    if a < faint { 0 } else { a }
-}
-
-/// Обратное деление премультиплицированного цвета на альфу.
-#[inline]
-fn unpremultiply(v: u8, a: u32) -> u8 {
-    // при a == 0 checked_div даёт None -> цвет 0 у прозрачного пикселя
-    ((v as u32 * 255 + a / 2).checked_div(a))
-        .unwrap_or_default()
-        .min(255) as u8
-}
-
-/// Фильтры из `image` с premultiplied alpha: цвет и альфа уменьшаются раздельно,
-/// затем цвет делится обратно на альфу.
-fn downscale_resize(src: &RgbaImage, gw: u32, gh: u32, ft: FilterType, faint: u8) -> RgbaImage {
-    let (w, h) = src.dimensions();
-    let n = w as usize * h as usize;
-
-    let mut pre = vec![0u8; n * 3];
-    let mut al = vec![0u8; n];
-    for ((dst, alpha), px) in pre
-        .chunks_exact_mut(3)
-        .zip(al.iter_mut())
-        .zip(src.as_raw().as_chunks::<4>().0.iter())
-    {
-        let a8 = clean_alpha(px[3], faint);
-        let a = a8 as u32;
-        dst[0] = ((px[0] as u32 * a + 127) / 255) as u8;
-        dst[1] = ((px[1] as u32 * a + 127) / 255) as u8;
-        dst[2] = ((px[2] as u32 * a + 127) / 255) as u8;
-        *alpha = a8;
-    }
-    let pre = RgbImage::from_raw(w, h, pre).expect("размер буфера");
-    let al = GrayImage::from_raw(w, h, al).expect("размер буфера");
-
-    let pre_s = image::imageops::resize(&pre, gw, gh, ft);
-    let al_s = image::imageops::resize(&al, gw, gh, ft);
-
-    let mut out = vec![0u8; gw as usize * gh as usize * 4];
-    for ((dst, c), &a) in out
-        .chunks_exact_mut(4)
-        .zip(pre_s.as_raw().as_chunks::<3>().0.iter())
-        .zip(al_s.as_raw().iter())
-    {
-        let a32 = a as u32;
-        dst[0] = unpremultiply(c[0], a32);
-        dst[1] = unpremultiply(c[1], a32);
-        dst[2] = unpremultiply(c[2], a32);
-        dst[3] = a;
-    }
-    RgbaImage::from_raw(gw, gh, out).expect("размер буфера")
+    crate::resize::clean_alpha(a, faint)
 }
 
 /// Делит изображение на `gw` x `gh` блоков. В режиме `mode` цвет блока — самый
@@ -239,41 +203,6 @@ fn threshold_rows(raw: &mut [u8], threshold: u8) {
 mod tests {
     use super::*;
 
-    /// Эталон: прежняя реализация на `push`. Нужна как оракул для проверки
-    /// чанкового варианта: арифметика обязана остаться той же.
-    fn downscale_resize_reference(src: &RgbaImage, gw: u32, gh: u32, ft: FilterType) -> RgbaImage {
-        let (w, h) = src.dimensions();
-        let n = w as usize * h as usize;
-        let mut pre = Vec::with_capacity(n * 3);
-        let mut al = Vec::with_capacity(n);
-        for p in src.as_raw().as_chunks::<4>().0 {
-            let a = p[3] as u32;
-            for &v in p.iter().take(3) {
-                pre.push(((v as u32 * a + 127) / 255) as u8);
-            }
-            al.push(p[3]);
-        }
-        let pre = RgbImage::from_raw(w, h, pre).expect("размер буфера");
-        let al = GrayImage::from_raw(w, h, al).expect("размер буфера");
-
-        let pre_s = image::imageops::resize(&pre, gw, gh, ft);
-        let al_s = image::imageops::resize(&al, gw, gh, ft);
-
-        let mut out = Vec::with_capacity(gw as usize * gh as usize * 4);
-        for (c, a) in pre_s.as_raw().as_chunks::<3>().0.iter().zip(al_s.as_raw()) {
-            let a32 = *a as u32;
-            for &v in c.iter() {
-                out.push(
-                    ((v as u32 * 255 + a32 / 2).checked_div(a32))
-                        .unwrap_or_default()
-                        .min(255) as u8,
-                );
-            }
-            out.push(*a);
-        }
-        RgbaImage::from_raw(gw, gh, out).expect("размер буфера")
-    }
-
     /// Фикстура с полупрозрачной каймой, мягкой маской и прозрачным углом.
     fn sprite_fixture(w: u32, h: u32, seed: u32) -> RgbaImage {
         let mut buf = Vec::with_capacity((w * h * 4) as usize);
@@ -337,33 +266,6 @@ mod tests {
                         want.as_raw(),
                         "пиксели: {w}x{h} -> {gw}x{gh}, {filter:?}"
                     );
-                }
-            }
-        }
-    }
-
-    /// Чанковый resize против push-эталона на уже очищенном исходнике:
-    /// арифметика не должна была измениться.
-    #[test]
-    fn resize_reference_unchanged() {
-        let fixtures = [(32u32, 24u32, 1u32), (17, 9, 2)];
-        let filters = [
-            FilterType::Lanczos3,
-            FilterType::CatmullRom,
-            FilterType::Triangle,
-            FilterType::Gaussian,
-            FilterType::Nearest,
-        ];
-        let targets = [(8u32, 8u32), (16, 12), (40, 30)];
-
-        for &(w, h, seed) in &fixtures {
-            let cut = precut(&sprite_fixture(w, h, seed));
-            for &ft in &filters {
-                for &(gw, gh) in &targets {
-                    let got = downscale_resize(&cut, gw, gh, ft, 0);
-                    let want = downscale_resize_reference(&cut, gw, gh, ft);
-                    assert_eq!(got.dimensions(), want.dimensions(), "{w}x{h} -> {gw}x{gh}, {ft:?}");
-                    assert_eq!(got.as_raw(), want.as_raw(), "пиксели: {ft:?}");
                 }
             }
         }
