@@ -6,11 +6,12 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
+    io::Write as _,
     path::{Path, PathBuf},
     time::Instant,
 };
 
-use image::{RgbImage, RgbaImage};
+use image::RgbaImage;
 use rayon::prelude::*;
 
 use crate::{
@@ -684,72 +685,78 @@ pub fn output_path(input: &Path, prefix: Option<&str>, suffix: &str) -> PathBuf 
 /// Сохраняет PNG: с заливкой фона, если задан `fill`; в RGB, если прозрачных
 /// пикселей нет; иначе в RGBA с сохранением прозрачности.
 ///
-/// Композит и упаковка идут по строкам: строка не зависит от соседних, поэтому
-/// строки можно раздать потокам. Само сжатие PNG остаётся однопоточным —
+/// Запись потоковая: строка собирается в буфер `width × 3` (или `× 4`) и сразу
+/// уходит в энкодер `png`. Раньше на всё изображение строился `Vec<u8>`
+/// (3 байта на пиксель) — на 24 Мп это 72 МБ пика только на упаковку.
+///
+/// Фильтр и компрессия — те же, что у `image` по умолчанию (`Adaptive` и
+/// `Default`), поэтому размер файла остаётся прежним. Сжатие однопоточное:
 /// порядок блоков IDAT фиксирован.
 pub fn save_png(img: &RgbaImage, fill: Option<Color>, path: &Path) -> Result<()> {
     let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return Err(Error::msg("пустое изображение"));
+    }
     let raw = img.as_raw();
     let pixels = raw.as_chunks::<4>().0;
-    let width = (w as usize).max(1);
+    let width = w as usize;
     let parallel = parallel::should_parallel(pixels.len());
 
-    if let Some(bg) = fill {
-        let mut out = vec![0u8; w as usize * h as usize * 3];
-        let row_bytes = (width * 3).max(1);
-        let composite = |src: &[[u8; 4]], dst: &mut [u8]| {
-            for (dst, p) in dst.chunks_exact_mut(3).zip(src) {
-                let a = p[3] as u32;
-                for c in 0..3 {
-                    dst[c] = ((p[c] as u32 * a + bg[c] as u32 * (255 - a) + 127) / 255) as u8;
+    let opaque = |row: &[[u8; 4]]| row.iter().all(|p| p[3] == 255);
+    let all_opaque = if fill.is_some() {
+        false
+    } else if parallel {
+        pixels.par_chunks(width).all(opaque)
+    } else {
+        pixels.chunks(width).all(opaque)
+    };
+
+    // С заливкой или без прозрачности — RGB, иначе RGBA.
+    let (color, channels) = if fill.is_some() || all_opaque {
+        (png::ColorType::Rgb, 3usize)
+    } else {
+        (png::ColorType::Rgba, 4)
+    };
+
+    let file = std::fs::File::create(path)?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    encoder.set_color(color);
+    encoder.set_depth(png::BitDepth::Eight);
+    // Те же настройки, что у `image` по умолчанию (`CompressionType::Fast` —
+    // это fdeflate, `Adaptive` — выбор фильтра по строке). Без явного `Fast`
+    // `png` берёт flate2 уровня 6, и запись 24 Мп растягивается с 60 до 780 мс.
+    encoder.set_compression(png::Compression::Fast);
+    encoder.set_filter(png::Filter::Adaptive);
+    let mut writer = encoder
+        .write_header()?
+        .into_stream_writer_with_size(256 * 1024)?;
+
+    let mut row = vec![0u8; width * channels];
+    for y in 0..h as usize {
+        let src = &pixels[y * width..(y + 1) * width];
+        match (fill, channels) {
+            (Some(bg), _) => {
+                for (dst, p) in row.chunks_exact_mut(3).zip(src) {
+                    let a = p[3] as u32;
+                    for c in 0..3 {
+                        dst[c] = ((p[c] as u32 * a + bg[c] as u32 * (255 - a) + 127) / 255) as u8;
+                    }
                 }
             }
-        };
-        if parallel {
-            pixels
-                .par_chunks(width)
-                .zip(out.par_chunks_mut(row_bytes))
-                .for_each(|(src, dst)| composite(src, dst));
-        } else {
-            for (src, dst) in pixels.chunks(width).zip(out.chunks_mut(row_bytes)) {
-                composite(src, dst);
-            }
-        }
-        RgbImage::from_raw(w, h, out)
-            .ok_or_else(|| Error::msg("размер буфера"))?
-            .save(path)?;
-    } else {
-        let opaque = |row: &[[u8; 4]]| row.iter().all(|p| p[3] == 255);
-        let all_opaque = if parallel {
-            pixels.par_chunks(width).all(opaque)
-        } else {
-            pixels.chunks(width).all(opaque)
-        };
-        if all_opaque {
-            let mut out = vec![0u8; w as usize * h as usize * 3];
-            let row_bytes = (width * 3).max(1);
-            let pack = |src: &[[u8; 4]], dst: &mut [u8]| {
-                for (dst, p) in dst.chunks_exact_mut(3).zip(src) {
+            (None, 3) => {
+                for (dst, p) in row.chunks_exact_mut(3).zip(src) {
                     dst.copy_from_slice(&p[..3]);
                 }
-            };
-            if parallel {
-                pixels
-                    .par_chunks(width)
-                    .zip(out.par_chunks_mut(row_bytes))
-                    .for_each(|(src, dst)| pack(src, dst));
-            } else {
-                for (src, dst) in pixels.chunks(width).zip(out.chunks_mut(row_bytes)) {
-                    pack(src, dst);
+            }
+            (None, _) => {
+                for (dst, p) in row.chunks_exact_mut(4).zip(src) {
+                    dst.copy_from_slice(&p[..4]);
                 }
             }
-            RgbImage::from_raw(w, h, out)
-                .ok_or_else(|| Error::msg("размер буфера"))?
-                .save(path)?;
-        } else {
-            img.save(path)?;
         }
+        writer.write_all(&row)?;
     }
+    writer.finish()?;
     Ok(())
 }
 
@@ -838,6 +845,82 @@ mod tests {
         }
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Ширина не кратна четырём и ширина 1: строки не должны «съезжать» —
+    /// потоковая запись идёт ровно по `width × channels` байт.
+    #[test]
+    fn stream_writer_row_padding() {
+        for w in [1u32, 3, 5, 13] {
+            let img = RgbaImage::from_fn(w, 4, |x, y| {
+                image::Rgba([(x * 10) as u8, (y * 20) as u8, 7, 255])
+            });
+            let path = temp_path(&format!("pad{w}"));
+            save_png(&img, None, &path).expect("запись");
+            assert_eq!(png_color_type(&path), 2, "непрозрачная — RGB, ширина {w}");
+            assert_eq!(read_back(&path).as_raw(), img.as_raw(), "ширина {w}");
+            std::fs::remove_file(&path).ok();
+        }
+
+        // То же для RGBA-ветки.
+        let img = RgbaImage::from_fn(3, 5, |x, y| {
+            image::Rgba([(x * 40) as u8, (y * 30) as u8, 9, if (x + y) % 2 == 0 { 0 } else { 200 }])
+        });
+        let path = temp_path("pad-rgba");
+        save_png(&img, None, &path).expect("запись");
+        assert_eq!(png_color_type(&path), 6, "есть прозрачность — RGBA");
+        assert_eq!(read_back(&path).as_raw(), img.as_raw());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Размер файла не вырос против прежнего пути (`image::save` того же
+    /// изображения): потоковая запись не должна менять фильтр и компрессию.
+    #[test]
+    fn png_size_within_budget() {
+        let opaque = RgbaImage::from_fn(240, 180, |x, y| {
+            image::Rgba([
+                (x * 3 % 256) as u8,
+                (y * 5 % 256) as u8,
+                ((x * y) % 256) as u8,
+                255,
+            ])
+        });
+        let alpha = RgbaImage::from_fn(240, 180, |x, y| {
+            image::Rgba([
+                (x * 7 % 256) as u8,
+                (y * 11 % 256) as u8,
+                ((x + y) % 256) as u8,
+                if (x * y) % 17 == 0 { 0 } else { 255 },
+            ])
+        });
+
+        let cases: [(&str, &RgbaImage, bool); 2] = [
+            ("opaque", &opaque, true),
+            ("alpha", &alpha, false),
+        ];
+        for (label, img, is_opaque) in cases {
+            let ours = temp_path(&format!("size-{label}"));
+            save_png(img, None, &ours).expect("наша запись");
+            let reference = temp_path(&format!("ref-{label}"));
+            // Прежний путь: непрозрачное уходило через RgbImage, остальное — как есть.
+            if is_opaque {
+                let rgb = image::RgbImage::from_fn(img.width(), img.height(), |x, y| {
+                    let p = img.get_pixel(x, y).0;
+                    image::Rgb([p[0], p[1], p[2]])
+                });
+                rgb.save(&reference).expect("эталонная запись");
+            } else {
+                img.save(&reference).expect("эталонная запись");
+            }
+            let ours_len = std::fs::metadata(&ours).expect("наш файл").len() as f64;
+            let reference_len = std::fs::metadata(&reference).expect("эталон").len() as f64;
+            assert!(
+                ours_len <= reference_len * 1.05,
+                "{label}: {ours_len} Б против {reference_len} Б (допуск +5%)"
+            );
+            std::fs::remove_file(&ours).ok();
+            std::fs::remove_file(&reference).ok();
+        }
     }
 
     /// Фикстура «фото»: полупрозрачная кайма, слабая альфа и прозрачные пиксели.

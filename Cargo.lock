@@ -1522,6 +1522,7 @@ name = "pixel-image-core"
 version = "0.8.0"
 dependencies = [
  "image",
+ "png",
  "rayon",
 ]
 

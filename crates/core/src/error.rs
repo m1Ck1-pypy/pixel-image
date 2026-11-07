@@ -55,5 +55,13 @@ impl From<io::Error> for Error {
     }
 }
 
+impl From<png::EncodingError> for Error {
+    /// Ошибка потоковой записи PNG приводится к обычной ошибке ввода-вывода:
+    /// наружу это всё равно «не удалось записать файл».
+    fn from(error: png::EncodingError) -> Self {
+        Self::Io(io::Error::from(error))
+    }
+}
+
 /// Результат операций библиотеки.
 pub type Result<T> = std::result::Result<T, Error>;
