@@ -15,7 +15,9 @@
 //! Тест печатает актуальные значения рядом с именами констант.
 
 use image::{Rgba, RgbaImage};
-use pixel_image_core::{BackgroundOptions, Filter, Options, convert_image, cutout_image};
+use pixel_image_core::{
+    BackgroundOptions, Filter, Options, convert_image, cutout_image, render_grid,
+};
 
 /// Детерминированная фикстура: градиент, «объект» с мягкой каймой, прозрачный
 /// угол и немного шума внутри объекта.
@@ -109,20 +111,23 @@ fn options_small(width: u32, cell: u32) -> Options {
 fn golden_sprite_box() {
     let src = fixture(64, 48, 1);
     let options = options_small(24, 8);
-    let conversion = convert_image(src, &options).expect("преобразование");
+    let conversion = convert_image(&src, &options).expect("преобразование");
 
     assert_eq!(conversion.sprite.dimensions(), (24, 18));
-    assert_eq!(conversion.grid.dimensions(), (24 * 8, 18 * 8));
     report("SPRITE_BOX", fingerprint(&conversion.sprite), SPRITE_BOX);
 }
 
+/// Сетка строится отдельно от превью, но обязана совпадать с прежним
+/// `Conversion::grid`: эталон снят ещё до разделения.
 #[test]
 fn golden_grid_box() {
     let src = fixture(64, 48, 1);
     let options = options_small(24, 8);
-    let conversion = convert_image(src, &options).expect("преобразование");
+    let conversion = convert_image(&src, &options).expect("преобразование");
+    let grid = render_grid(&conversion.sprite, &options).expect("сетка");
 
-    report("GRID_BOX", fingerprint(&conversion.grid), GRID_BOX);
+    assert_eq!(grid.dimensions(), (24 * 8, 18 * 8));
+    report("GRID_BOX", fingerprint(&grid), GRID_BOX);
 }
 
 #[test]
@@ -135,7 +140,7 @@ fn golden_sprite_lanczos() {
         filter: Filter::Lanczos,
         ..Options::default()
     };
-    let conversion = convert_image(src, &options).expect("преобразование");
+    let conversion = convert_image(&src, &options).expect("преобразование");
 
     report("SPRITE_LANCZOS", fingerprint(&conversion.sprite), SPRITE_LANCZOS);
 }
@@ -144,7 +149,7 @@ fn golden_sprite_lanczos() {
 fn golden_stats() {
     let src = fixture(64, 48, 1);
     let options = options_small(24, 8);
-    let conversion = convert_image(src, &options).expect("преобразование");
+    let conversion = convert_image(&src, &options).expect("преобразование");
     let stats = &conversion.stats;
 
     assert_eq!(stats.grid_width, 24);

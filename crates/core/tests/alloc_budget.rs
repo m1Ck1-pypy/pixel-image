@@ -152,7 +152,7 @@ fn pixel_art_allocation_budget() {
     let src = fixture(256, 256, 7);
     let options = Options::default();
 
-    let (conversion, budget) = measure(|| convert_image(src, &options).expect("преобразование"));
+    let (conversion, budget) = measure(|| convert_image(&src, &options).expect("преобразование"));
     println!("pixel_art: {budget:?}");
 
     assert_eq!(conversion.stats.grid_width, 128);
@@ -215,10 +215,13 @@ fn cutout_allocation_budget() {
 // поэтому при осознанном улучшении числа уменьшают (этапы 2, 4, 5 плана),
 // а при обоснованном ухудшении — увеличивают с записью в `optimaze.md`.
 //
-// 256×256, сетка 128×128, cell 16: пик — сетка 16 384 КиБ + спрайт.
-const PIXEL_ART_ALLOCS: usize = 134;
+// 256×256, сетка 128×128, cell 16.
+// Этап 2 убрал из `convert_image` растр сетки (2048×2048×4), поэтому пик
+// pixel-art упал с ~16 500 КиБ до ~833 КиБ: остались исходник, премультиплай
+// и спрайт. Cutout пока не трогали — там копия исходника обязательна.
+const PIXEL_ART_ALLOCS: usize = 132;
 const PIXEL_ART_REALLOCS: usize = 37;
-const PIXEL_ART_PEAK_KIB: usize = 16_700;
+const PIXEL_ART_PEAK_KIB: usize = 900;
 const CUTOUT_ALLOCS: usize = 50;
 const CUTOUT_REALLOCS: usize = 40;
 const CUTOUT_PEAK_KIB: usize = 1_700;

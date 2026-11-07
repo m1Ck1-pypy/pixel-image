@@ -289,7 +289,7 @@ fn dump_ui(output: &Path, image_path: Option<&Path>) -> anyhow::Result<()> {
         && flags.wants_pixel_result()
     {
         let options = model.params.preview_options();
-        let conversion = pixel_image_core::convert_image((**image).clone(), &options)
+        let conversion = pixel_image_core::convert_image(image.as_ref(), &options)
             .context("не удалось сгенерировать изображение для дампа")?;
         let params = model.params;
         let mut stats = conversion.stats;

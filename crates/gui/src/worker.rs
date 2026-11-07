@@ -20,7 +20,7 @@ use winit::event_loop::EventLoopProxy;
 
 /// Longest side of the cutout copy used for the screen. Export always uses the
 /// full-resolution core path, so this only limits preview memory and paint cost.
-const DISPLAY_LIMIT: u32 = 4096;
+const DISPLAY_LIMIT: u32 = 2048;
 
 /// Wake-up event for the winit event loop.
 pub enum UserEvent {
@@ -313,7 +313,7 @@ fn load(path: &Path, generation: u64) -> WorkerResult {
 fn generate(job: u64, file: u64, source: &Arc<RgbaImage>, options: &Options) -> WorkerResult {
     let started = Instant::now();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pixel_image_core::convert_image((**source).clone(), options)
+        pixel_image_core::convert_image(source.as_ref(), options)
     }))
     .unwrap_or_else(|_| Err(Error::msg("ВНУТРЕННЯЯ ОШИБКА ГЕНЕРАЦИИ")));
     let elapsed = started.elapsed();
@@ -454,5 +454,42 @@ fn format_name(path: &Path) -> String {
         Ok(image::ImageFormat::Gif) => "GIF".to_string(),
         Ok(other) => format!("{other:?}").to_uppercase(),
         Err(_) => "ИЗОБРАЖЕНИЕ".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn solid(w: u32, h: u32) -> RgbaImage {
+        let mut img = RgbaImage::new(w, h);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgba([(x % 256) as u8, (y % 256) as u8, 128, 255]);
+        }
+        img
+    }
+
+    #[test]
+    fn shrink_for_display_limits() {
+        // Меньше лимита — не трогаем (ни размеров, ни пикселей).
+        let small = solid(300, 200);
+        let same = shrink_for_display(small.clone());
+        assert_eq!(same.dimensions(), (300, 200));
+        assert_eq!(same.as_raw(), small.as_raw());
+
+        // Больше лимита — длинная сторона ровно DISPLAY_LIMIT, пропорции те же.
+        let shrunk = shrink_for_display(solid(2400, 1800));
+        assert_eq!(shrunk.dimensions(), (DISPLAY_LIMIT, DISPLAY_LIMIT * 3 / 4));
+
+        let portrait = shrink_for_display(solid(1200, 3200));
+        assert_eq!(portrait.dimensions(), (DISPLAY_LIMIT * 3 / 8, DISPLAY_LIMIT));
+    }
+
+    #[test]
+    fn shrink_for_display_is_idempotent() {
+        let once = shrink_for_display(solid(2400, 1800));
+        let twice = shrink_for_display(once.clone());
+        assert_eq!(twice.dimensions(), once.dimensions());
+        assert_eq!(twice.as_raw(), once.as_raw());
     }
 }

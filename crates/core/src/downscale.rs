@@ -27,18 +27,28 @@ impl Filter {
     /// Уменьшает изображение до `gw` x `gh` этим фильтром с учётом альфа-канала:
     /// цвет краевых пикселей считается только по непрозрачной части, поэтому фон
     /// «под» прозрачностью (белый или чёрный) не подмешивается в контур.
-    pub fn downscale(&self, src: &RgbaImage, gw: u32, gh: u32) -> RgbaImage {
+    ///
+    /// `faint` — пиксели с `0 < альфа < faint` считаются полностью прозрачными
+    /// (мягкая маска от JPEG-сглаживания). Так исходник не нужно копировать и
+    /// чистить перед уменьшением: фильтр сам не берёт их в расчёт.
+    pub fn downscale(&self, src: &RgbaImage, gw: u32, gh: u32, faint: u8) -> RgbaImage {
         let ft = match *self {
             Filter::Lanczos => FilterType::Lanczos3,
             Filter::Catmull => FilterType::CatmullRom,
             Filter::Triangle => FilterType::Triangle,
             Filter::Gaussian => FilterType::Gaussian,
             Filter::Nearest => FilterType::Nearest,
-            Filter::Box => return downscale_blocks(src, gw, gh, false),
-            Filter::Mode => return downscale_blocks(src, gw, gh, true),
+            Filter::Box => return downscale_blocks(src, gw, gh, false, faint),
+            Filter::Mode => return downscale_blocks(src, gw, gh, true, faint),
         };
-        downscale_resize(src, gw, gh, ft)
+        downscale_resize(src, gw, gh, ft, faint)
     }
+}
+
+/// Альфа с отсечением мягкой маски: `0 < a < faint` -> 0.
+#[inline]
+fn clean_alpha(a: u8, faint: u8) -> u8 {
+    if a < faint { 0 } else { a }
 }
 
 /// Обратное деление премультиплицированного цвета на альфу.
@@ -52,7 +62,7 @@ fn unpremultiply(v: u8, a: u32) -> u8 {
 
 /// Фильтры из `image` с premultiplied alpha: цвет и альфа уменьшаются раздельно,
 /// затем цвет делится обратно на альфу.
-fn downscale_resize(src: &RgbaImage, gw: u32, gh: u32, ft: FilterType) -> RgbaImage {
+fn downscale_resize(src: &RgbaImage, gw: u32, gh: u32, ft: FilterType, faint: u8) -> RgbaImage {
     let (w, h) = src.dimensions();
     let n = w as usize * h as usize;
 
@@ -63,11 +73,12 @@ fn downscale_resize(src: &RgbaImage, gw: u32, gh: u32, ft: FilterType) -> RgbaIm
         .zip(al.iter_mut())
         .zip(src.as_raw().as_chunks::<4>().0.iter())
     {
-        let a = px[3] as u32;
+        let a8 = clean_alpha(px[3], faint);
+        let a = a8 as u32;
         dst[0] = ((px[0] as u32 * a + 127) / 255) as u8;
         dst[1] = ((px[1] as u32 * a + 127) / 255) as u8;
         dst[2] = ((px[2] as u32 * a + 127) / 255) as u8;
-        *alpha = px[3];
+        *alpha = a8;
     }
     let pre = RgbImage::from_raw(w, h, pre).expect("размер буфера");
     let al = GrayImage::from_raw(w, h, al).expect("размер буфера");
@@ -94,7 +105,7 @@ fn downscale_resize(src: &RgbaImage, gw: u32, gh: u32, ft: FilterType) -> RgbaIm
 /// частый цвет среди непрозрачных пикселей (цвета группируются по 5 бит на канал,
 /// внутри победившей группы берётся среднее). Иначе — среднее с весом альфы.
 /// Альфа блока — среднее альфы всех его пикселей.
-fn downscale_blocks(src: &RgbaImage, gw: u32, gh: u32, mode: bool) -> RgbaImage {
+fn downscale_blocks(src: &RgbaImage, gw: u32, gh: u32, mode: bool, faint: u8) -> RgbaImage {
     let (w, h) = src.dimensions();
     let raw = src.as_raw();
     let mut out = vec![0u8; gw as usize * gh as usize * 4];
@@ -116,7 +127,12 @@ fn downscale_blocks(src: &RgbaImage, gw: u32, gh: u32, mode: bool) -> RgbaImage 
                 let row = y as usize * w as usize * 4;
                 for x in x0..x1 {
                     let i = row + x as usize * 4;
-                    let (r, g, b, a) = (raw[i], raw[i + 1], raw[i + 2], raw[i + 3]);
+                    let (r, g, b, a) = (
+                        raw[i],
+                        raw[i + 1],
+                        raw[i + 2],
+                        clean_alpha(raw[i + 3], faint),
+                    );
                     sum_a += a as u64;
                     if mode {
                         if a >= 128 {
@@ -225,7 +241,7 @@ mod tests {
         RgbaImage::from_raw(gw, gh, out).expect("размер буфера")
     }
 
-    /// Фикстура с полупрозрачной каймой и полностью прозрачным углом.
+    /// Фикстура с полупрозрачной каймой, мягкой маской и прозрачным углом.
     fn sprite_fixture(w: u32, h: u32, seed: u32) -> RgbaImage {
         let mut buf = Vec::with_capacity((w * h * 4) as usize);
         for y in 0..h {
@@ -233,6 +249,8 @@ mod tests {
                 let edge = x < w / 4 && y < h / 4;
                 let alpha = if edge {
                     0
+                } else if (x + y + seed) % 7 == 0 {
+                    12 // слабая альфа: считается прозрачной
                 } else if (x + y + seed) % 5 == 0 {
                     128
                 } else {
@@ -249,9 +267,53 @@ mod tests {
         RgbaImage::from_raw(w, h, buf).expect("фикстура")
     }
 
+    /// Прежняя семантика: слабая альфа обнулена заранее, отдельной копией.
+    fn precut(src: &RgbaImage) -> RgbaImage {
+        let mut copy = src.clone();
+        crate::clean::cut_faint_alpha(copy.as_mut(), crate::pipeline::FAINT_ALPHA);
+        copy
+    }
+
+    const ALL_FILTERS: [Filter; 7] = [
+        Filter::Lanczos,
+        Filter::Catmull,
+        Filter::Triangle,
+        Filter::Gaussian,
+        Filter::Nearest,
+        Filter::Box,
+        Filter::Mode,
+    ];
+
+    /// Новый путь (исходник как есть + отсечение слабой альфы внутри фильтра)
+    /// обязан совпадать со старым (копия с обнулённой слабой альфой).
     #[test]
     fn filter_output_unchanged() {
         let fixtures = [(32u32, 24u32, 1u32), (17, 9, 2), (64, 48, 3)];
+        let targets = [(8u32, 8u32), (16, 12), (40, 30)];
+
+        for &(w, h, seed) in &fixtures {
+            let raw = sprite_fixture(w, h, seed);
+            let cut = precut(&raw);
+            for filter in ALL_FILTERS {
+                for &(gw, gh) in &targets {
+                    let got = filter.downscale(&raw, gw, gh, crate::pipeline::FAINT_ALPHA);
+                    let want = filter.downscale(&cut, gw, gh, 0);
+                    assert_eq!(got.dimensions(), want.dimensions(), "{w}x{h} -> {gw}x{gh}, {filter:?}");
+                    assert_eq!(
+                        got.as_raw(),
+                        want.as_raw(),
+                        "пиксели: {w}x{h} -> {gw}x{gh}, {filter:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Чанковый resize против push-эталона на уже очищенном исходнике:
+    /// арифметика не должна была измениться.
+    #[test]
+    fn resize_reference_unchanged() {
+        let fixtures = [(32u32, 24u32, 1u32), (17, 9, 2)];
         let filters = [
             FilterType::Lanczos3,
             FilterType::CatmullRom,
@@ -262,35 +324,31 @@ mod tests {
         let targets = [(8u32, 8u32), (16, 12), (40, 30)];
 
         for &(w, h, seed) in &fixtures {
-            let src = sprite_fixture(w, h, seed);
+            let cut = precut(&sprite_fixture(w, h, seed));
             for &ft in &filters {
                 for &(gw, gh) in &targets {
-                    let got = downscale_resize(&src, gw, gh, ft);
-                    let want = downscale_resize_reference(&src, gw, gh, ft);
-                    assert_eq!(
-                        got.dimensions(),
-                        want.dimensions(),
-                        "{w}x{h} -> {gw}x{gh}, {ft:?}"
-                    );
-                    assert_eq!(
-                        got.as_raw(),
-                        want.as_raw(),
-                        "пиксели: {w}x{h} -> {gw}x{gh}, {ft:?}"
-                    );
+                    let got = downscale_resize(&cut, gw, gh, ft, 0);
+                    let want = downscale_resize_reference(&cut, gw, gh, ft);
+                    assert_eq!(got.dimensions(), want.dimensions(), "{w}x{h} -> {gw}x{gh}, {ft:?}");
+                    assert_eq!(got.as_raw(), want.as_raw(), "пиксели: {ft:?}");
                 }
             }
         }
     }
 
-    /// Блочные фильтры (box/mode) не ходят через `pre`/`al` — проверяем, что
-    /// их результат не зависит от чанковой упаковки.
+    /// Пиксель со слабой альфой эквивалентен полностью прозрачному: цвет
+    /// «под» ним не подмешивается ни в одном фильтре.
     #[test]
-    fn block_filters_unchanged() {
-        let src = sprite_fixture(48, 36, 5);
-        for filter in [Filter::Box, Filter::Mode] {
-            let a = filter.downscale(&src, 12, 9);
-            let b = filter.downscale(&src, 12, 9);
-            assert_eq!(a.as_raw(), b.as_raw(), "повторный вызов {filter:?}");
+    fn faint_alpha_counts_as_transparent() {
+        let with_faint =
+            RgbaImage::from_raw(2, 1, vec![200, 100, 50, 15, 10, 20, 30, 255]).expect("фикстура");
+        let zeroed =
+            RgbaImage::from_raw(2, 1, vec![0, 0, 0, 0, 10, 20, 30, 255]).expect("фикстура");
+
+        for filter in ALL_FILTERS {
+            let a = filter.downscale(&with_faint, 1, 1, crate::pipeline::FAINT_ALPHA);
+            let b = filter.downscale(&zeroed, 1, 1, crate::pipeline::FAINT_ALPHA);
+            assert_eq!(a.as_raw(), b.as_raw(), "{filter:?}");
         }
     }
 

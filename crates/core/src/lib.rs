@@ -25,7 +25,7 @@ pub use color::Color;
 pub use downscale::Filter;
 pub use error::{Error, Result};
 pub use pipeline::{
-    BackgroundOptions, BackgroundStats, CleanStats, Conversion, Cutout, Options, SavedConversion,
-    SavedCutout, StageTimes, Stats, clean_source, convert_file, convert_image, convert_image_timed,
-    cutout_file, cutout_image, output_path, save_png,
+    BackgroundOptions, BackgroundStats, CleanStats, Conversion, Cutout, FAINT_ALPHA, Options,
+    SavedConversion, SavedCutout, StageTimes, Stats, clean_source, convert_file, convert_image,
+    convert_image_timed, cutout_file, cutout_image, output_path, render_grid, save_png,
 };

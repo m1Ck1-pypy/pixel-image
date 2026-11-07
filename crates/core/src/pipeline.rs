@@ -4,6 +4,7 @@
 //! [`Stats`] / [`CleanStats`], а вызывающая сторона решает, как их показать.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     path::{Path, PathBuf},
     time::Instant,
@@ -221,9 +222,10 @@ fn since(started: Instant) -> f32 {
 /// Результат преобразования в памяти.
 #[derive(Debug)]
 pub struct Conversion {
-    /// Пиксель-арт с сеткой.
-    pub grid: RgbaImage,
     /// Чистый спрайт в разрешении сетки.
+    ///
+    /// Растр с сеткой здесь намеренно отсутствует: превью рисует сетку на лету,
+    /// а экспорт строит её [`render_grid`] уже на диске.
     pub sprite: RgbaImage,
     /// Счётчики этапов.
     pub stats: Stats,
@@ -328,8 +330,27 @@ pub fn clean_source(src: &mut RgbaImage, background: Option<&BackgroundOptions>)
     }
 }
 
+/// Пиксели со слабой альфой (мягкая маска от JPEG-сглаживания) считаются
+/// полностью прозрачными. Раньше для этого исходник копировали и чистили на
+/// месте; теперь вырезание делает уменьшение (см. `Filter::downscale`).
+pub const FAINT_ALPHA: u8 = 16;
+
+/// Сколько пикселей со слабой альфой есть в исходнике — для [`CleanStats`].
+fn count_faint_alpha(src: &RgbaImage) -> usize {
+    src.as_raw()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[3] != 0 && p[3] < FAINT_ALPHA)
+        .count()
+}
+
 /// Превращает RGBA-изображение в пиксель-арт, не трогая диск.
-pub fn convert_image(src: RgbaImage, options: &Options) -> Result<Conversion> {
+///
+/// Исходник только читается: копия делается лишь при включённом вырезании фона
+/// (там изображение действительно меняется). Растр сетки здесь не строится —
+/// для превью он не нужен, для экспорта есть [`render_grid`].
+pub fn convert_image(src: &RgbaImage, options: &Options) -> Result<Conversion> {
     convert_image_timed(src, options).map(|(conversion, _)| conversion)
 }
 
@@ -337,17 +358,32 @@ pub fn convert_image(src: RgbaImage, options: &Options) -> Result<Conversion> {
 ///
 /// Нужно для `--verbose` в CLI: ядро само ничего не печатает.
 pub fn convert_image_timed(
-    mut src: RgbaImage,
+    src: &RgbaImage,
     options: &Options,
 ) -> Result<(Conversion, StageTimes)> {
     options.validate()?;
     let mut times = StageTimes::default();
 
     let started = Instant::now();
-    let clean_stats = clean_source(&mut src, options.background_removal.as_ref());
+    // Копия нужна только вырезанию фона. В обычном режиме работаем по ссылке,
+    // а слабую альфу отсекает само уменьшение.
+    let (clean_stats, working) = match options.background_removal.as_ref() {
+        Some(background) => {
+            let mut copy = src.clone();
+            let stats = clean_source(&mut copy, Some(background));
+            (stats, Cow::Owned(copy))
+        }
+        None => (
+            CleanStats {
+                faint_alpha_removed: count_faint_alpha(src),
+                background: None,
+            },
+            Cow::Borrowed(src),
+        ),
+    };
     times.clean = since(started);
 
-    let (w, h) = src.dimensions();
+    let (w, h) = working.dimensions();
     if w == 0 || h == 0 {
         return Err(Error::msg("пустое изображение"));
     }
@@ -356,9 +392,11 @@ pub fn convert_image_timed(
     let grid_h = ((h as f64 * grid_w as f64 / w as f64).round() as u32).max(1);
 
     let started = Instant::now();
-    let mut sprite = options.filter.downscale(&src, grid_w, grid_h);
+    let mut sprite = options
+        .filter
+        .downscale(&working, grid_w, grid_h, FAINT_ALPHA);
     times.downscale = since(started);
-    drop(src); // исходник больше не нужен
+    drop(working); // исходник больше не нужен
 
     let started = Instant::now();
     apply_alpha_threshold(&mut sprite, options.alpha_threshold);
@@ -403,23 +441,16 @@ pub fn convert_image_timed(
     }
     times.remap = since(started);
 
-    let started = Instant::now();
-    let alpha = (options.grid_opacity as u32 * 255 + 50) / 100;
-    let big = if let Some(fill) = options.fill {
-        let mut filled = sprite.clone();
-        for p in filled.as_mut().as_chunks_mut::<4>().0 {
-            if p[3] == 0 {
-                p.copy_from_slice(&[fill[0], fill[1], fill[2], 255]);
-            }
-        }
-        upscale_with_grid(&filled, options.cell, options.grid_color, alpha, true)?
-    } else {
-        upscale_with_grid(&sprite, options.cell, options.grid_color, alpha, true)?
-    };
-    times.upscale = since(started);
+    // Растр сетки здесь не строится: превью рисует сетку само (GUI), а экспорт
+    // вызывает `render_grid` из `convert_file`. Размер выхода считается
+    // арифметикой, чтобы статистика осталась прежней.
+    let output_width = grid_w
+        .checked_mul(options.cell)
+        .ok_or_else(|| Error::msg("итоговая ширина слишком велика"))?;
+    let output_height = grid_h
+        .checked_mul(options.cell)
+        .ok_or_else(|| Error::msg("итоговая высота слишком велика"))?;
 
-    let output_width = big.width();
-    let output_height = big.height();
     let stats = Stats {
         grid_width: grid_w,
         grid_height: grid_h,
@@ -433,14 +464,27 @@ pub fn convert_image_timed(
         clean: clean_stats,
     };
 
-    Ok((
-        Conversion {
-            grid: big,
-            sprite,
-            stats,
-        },
-        times,
-    ))
+    Ok((Conversion { sprite, stats }, times))
+}
+
+/// Строит итоговое изображение с сеткой из готового спрайта.
+///
+/// Нужно только экспорту: превью в GUI рисует сетку на лету и этот растр не
+/// использует. Вынесено отдельно, чтобы `convert_image` не платил за
+/// `grid_w·cell × grid_h·cell × 4` байт на каждую генерацию.
+pub fn render_grid(sprite: &RgbaImage, options: &Options) -> Result<RgbaImage> {
+    let alpha = (options.grid_opacity as u32 * 255 + 50) / 100;
+    if let Some(fill) = options.fill {
+        let mut filled = sprite.clone();
+        for p in filled.as_mut().as_chunks_mut::<4>().0 {
+            if p[3] == 0 {
+                p.copy_from_slice(&[fill[0], fill[1], fill[2], 255]);
+            }
+        }
+        upscale_with_grid(&filled, options.cell, options.grid_color, alpha, true)
+    } else {
+        upscale_with_grid(sprite, options.cell, options.grid_color, alpha, true)
+    }
 }
 
 /// Читает файл, превращает его в пиксель-арт и сохраняет `_grid.png` и
@@ -457,18 +501,18 @@ pub fn convert_file(
         ..StageTimes::default()
     };
 
-    let (Conversion {
-        grid,
-        sprite,
-        stats,
-    }, stage) = convert_image_timed(src, options)?;
+    let (Conversion { sprite, stats }, stage) = convert_image_timed(&src, options)?;
     times.clean = stage.clean;
     times.downscale = stage.downscale;
     times.threshold = stage.threshold;
     times.histogram = stage.histogram;
     times.palette = stage.palette;
     times.remap = stage.remap;
-    times.upscale = stage.upscale;
+    drop(src); // исходник для сетки не нужен
+
+    let started = Instant::now();
+    let grid = render_grid(&sprite, options)?;
+    times.upscale = since(started);
 
     let started = Instant::now();
     let grid_path = output_path(input, prefix, "_grid.png");
@@ -664,5 +708,102 @@ mod tests {
         }
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Фикстура «фото»: полупрозрачная кайма, слабая альфа и прозрачные пиксели.
+    fn photo(w: u32, h: u32) -> RgbaImage {
+        let mut img = RgbaImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let alpha = match (x + y) % 11 {
+                    0 => 0,
+                    1 => 12, // слабая альфа — должен считаться прозрачным
+                    2 => 140,
+                    _ => 255,
+                };
+                img.put_pixel(
+                    x,
+                    y,
+                    image::Rgba([(x * 9 % 256) as u8, (y * 7 % 256) as u8, 200, alpha]),
+                );
+            }
+        }
+        img
+    }
+
+    /// Превью не материализует сетку: размеры выхода считаются арифметикой,
+    /// а растр появляется только в `render_grid`.
+    #[test]
+    fn convert_image_needs_no_grid() {
+        let src = photo(16, 12);
+        let options = Options {
+            width: 8,
+            cell: 5,
+            colors: 8,
+            ..Options::default()
+        };
+
+        let conversion = convert_image(&src, &options).expect("преобразование");
+        assert_eq!(conversion.sprite.dimensions(), (8, 6));
+        assert_eq!(conversion.stats.output_width, 40);
+        assert_eq!(conversion.stats.output_height, 30);
+
+        let grid = render_grid(&conversion.sprite, &options).expect("сетка");
+        assert_eq!(grid.dimensions(), (40, 30));
+    }
+
+    /// Исходник не мутируется ни в обычном режиме, ни при вырезании фона.
+    #[test]
+    fn source_not_mutated() {
+        let src = photo(24, 18);
+        let before: Vec<u8> = src.as_raw().clone();
+
+        let plain = Options {
+            width: 12,
+            cell: 4,
+            ..Options::default()
+        };
+        convert_image(&src, &plain).expect("без вырезания фона");
+        assert_eq!(src.as_raw(), &before, "обычный режим не меняет исходник");
+
+        let with_bg = Options {
+            width: 12,
+            cell: 4,
+            background_removal: Some(BackgroundOptions::default()),
+            ..Options::default()
+        };
+        convert_image(&src, &with_bg).expect("с вырезанием фона");
+        assert_eq!(src.as_raw(), &before, "вырезание фона не меняет исходник");
+    }
+
+    /// Отсечение слабой альфы внутри уменьшения эквивалентно прежней
+    /// предварительной зачистке копии.
+    #[test]
+    fn faint_alpha_equivalent_to_precut() {
+        let src = photo(40, 30);
+        let options = Options {
+            width: 20,
+            cell: 4,
+            ..Options::default()
+        };
+
+        let mut cut = src.clone();
+        let removed = clean::cut_faint_alpha(cut.as_mut(), FAINT_ALPHA);
+        assert!(removed > 0, "фикстура обязана содержать слабую альфу");
+
+        let direct = convert_image(&src, &options).expect("как есть");
+        let precut = convert_image(&cut, &options).expect("предварительно очищенный");
+
+        assert_eq!(
+            direct.sprite.as_raw(),
+            precut.sprite.as_raw(),
+            "спрайт обязан совпасть"
+        );
+        assert_eq!(direct.stats.unique_colors, precut.stats.unique_colors);
+        assert_eq!(direct.stats.palette_colors, precut.stats.palette_colors);
+        assert_eq!(
+            direct.stats.clean.faint_alpha_removed, removed,
+            "счётчик слабой альфы считается по исходнику"
+        );
     }
 }
