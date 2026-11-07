@@ -100,6 +100,8 @@ pub struct App {
     /// Settings document location; `None` when the platform has no config dir.
     settings_path: Option<PathBuf>,
     saved_settings: Settings,
+    /// Отпечаток состояния, соответствующего `saved_settings`.
+    saved_signature: u64,
     save_pending: Option<Instant>,
     /// Logical window size persisted in the settings file. This is always the
     /// floating size: the client area of a maximized window follows the
@@ -126,6 +128,7 @@ impl App {
         model.reset_history();
         let window_size = loaded.settings.window_size();
         let window_maximized = loaded.settings.window.maximized;
+        let saved_signature = Settings::signature(&model, window_size, window_maximized);
         let worker = Worker::spawn(proxy.clone());
         let mut app = Self {
             window: None,
@@ -149,6 +152,7 @@ impl App {
             fit_percent: None,
             drag: None,
             settings_path,
+            saved_signature,
             saved_settings: loaded.settings,
             save_pending: None,
             window_size,
@@ -1114,8 +1118,11 @@ impl App {
             return;
         };
         self.refresh_window_state();
-        let current = Settings::from_model(&self.model, self.window_size, self.window_maximized);
-        if current == self.saved_settings {
+        // Отпечаток вместо `Settings::from_model`: на статичном кадре это
+        // сравнение двух `u64`, а не десяток `String` и список недавних файлов.
+        let signature =
+            Settings::signature(&self.model, self.window_size, self.window_maximized);
+        if signature == self.saved_signature {
             self.save_pending = None;
             return;
         }
@@ -1124,11 +1131,17 @@ impl App {
             None => self.save_pending = Some(now + SETTINGS_SAVE_DELAY),
             Some(due) if now >= due => {
                 self.save_pending = None;
+                let current =
+                    Settings::from_model(&self.model, self.window_size, self.window_maximized);
                 match settings::save(&path, &current) {
-                    Ok(()) => self.saved_settings = current,
+                    Ok(()) => {
+                        self.saved_settings = current;
+                        self.saved_signature = signature;
+                    }
                     Err(problem) => {
                         // Do not retry on a broken destination; report once.
                         self.saved_settings = current;
+                        self.saved_signature = signature;
                         self.model.toast(ToastTone::Error, problem);
                         self.request_redraw();
                     }
@@ -1147,6 +1160,8 @@ impl App {
         let current = Settings::from_model(&self.model, self.window_size, self.window_maximized);
         match settings::save(&path, &current) {
             Ok(()) => {
+                self.saved_signature =
+                    Settings::signature(&self.model, self.window_size, self.window_maximized);
                 self.saved_settings = current;
                 self.save_pending = None;
             }

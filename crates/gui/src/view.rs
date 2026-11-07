@@ -123,7 +123,7 @@ pub fn draw(
         font,
         header,
         "PIXEL-IMAGE",
-        &format!("ВЕРСИЯ {}", env!("CARGO_PKG_VERSION")),
+        concat!("ВЕРСИЯ ", env!("CARGO_PKG_VERSION")),
         metrics,
     );
 
@@ -2563,4 +2563,106 @@ fn wrap_limit(
         }
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Прежний `elide_middle` (без заимствования): эталон для будущих
+    /// оптимизаций этих функций.
+    fn elide_middle_reference(font: &Font, text: &str, max_width: i32, scale: i32) -> String {
+        if font.width(text, scale) <= max_width {
+            return text.to_string();
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let adv = font.advance(scale).max(1);
+        let max_chars = (max_width / adv).max(6) as usize;
+        if chars.len() <= max_chars {
+            return text.to_string();
+        }
+        let keep = max_chars.saturating_sub(3);
+        let left = keep / 2;
+        let right = keep - left;
+        let mut out = String::new();
+        out.extend(chars.iter().take(left));
+        out.push_str("...");
+        out.extend(chars.iter().skip(chars.len() - right));
+        out
+    }
+
+    /// Усечение по центру и перенос по ширине обязаны совпадать с прежним
+    /// выводом: это текст в UI, его нельзя менять «оптимизируя».
+    #[test]
+    fn elide_and_wrap_unchanged() {
+        let font = Font::new();
+        let scale = 2;
+        let samples = [
+            "",
+            "a",
+            "фото.jpg",
+            "/очень/длинный/путь/к/файлу/с/картинкой.png",
+            "C:\\Users\\пользователь\\Изображения\\отпуск-2026-финал.jpg",
+            "кириллица",
+            "1234567890",
+            "ш",
+            "СОХРАНЕНО",
+            "上上下下左右左右",
+        ];
+        for text in samples {
+            for max_width in [0, 7, 24, 64, 200, 4000] {
+                assert_eq!(
+                    elide_middle(&font, text, max_width, scale),
+                    elide_middle_reference(&font, text, max_width, scale),
+                    "усечение «{text}» при ширине {max_width}"
+                );
+
+                let wrapped = wrap_limit(&font, text, max_width.max(1), scale, 3);
+                let reference: Vec<String> = wrap_limit_reference(&font, text, max_width.max(1), scale, 3);
+                assert_eq!(wrapped, reference, "перенос «{text}» при ширине {max_width}");
+            }
+        }
+
+        // Пустая строка, один символ и строка ровно в границу не усекаются.
+        assert_eq!(elide_middle(&font, "", 100, scale), "");
+        assert_eq!(elide_middle(&font, "ф", 100, scale), "ф");
+        let exact = font.width("фото", scale);
+        assert_eq!(elide_middle(&font, "фото", exact, scale), "фото");
+
+        // Многострочный текст переносится по абзацам и уважает лимит строк.
+        let lines = wrap_limit(&font, "один\nдва\nтри\nчетыре", 4000, scale, 3);
+        assert_eq!(lines, vec!["один", "два", "три"]);
+    }
+
+    /// Эталон переноса — буквальная копия текущей реализации.
+    fn wrap_limit_reference(
+        font: &Font,
+        text: &str,
+        max_width: i32,
+        scale: i32,
+        max_lines: usize,
+    ) -> Vec<String> {
+        let mut lines = Vec::new();
+        for paragraph in text.split('\n') {
+            let mut line = String::new();
+            let mut width = 0;
+            for ch in paragraph.chars() {
+                let char_width = font.advance(scale);
+                if width + char_width > max_width && !line.is_empty() {
+                    lines.push(std::mem::take(&mut line));
+                    width = 0;
+                    if lines.len() >= max_lines {
+                        return lines;
+                    }
+                }
+                line.push(ch);
+                width += char_width;
+            }
+            lines.push(line);
+            if lines.len() >= max_lines {
+                return lines;
+            }
+        }
+        lines
+    }
 }

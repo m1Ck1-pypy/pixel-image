@@ -160,7 +160,121 @@ pub struct Loaded {
     pub problem: Option<String>,
 }
 
+/// FNV-1a по полям модели: см. [`Settings::signature`].
+struct Signature(u64);
+
+impl Signature {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn byte(&mut self, byte: u8) {
+        self.0 ^= u64::from(byte);
+        self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.byte(byte);
+        }
+    }
+
+    fn u8(&mut self, value: u8) {
+        self.byte(value);
+    }
+
+    fn u16(&mut self, value: u16) {
+        self.bytes(&value.to_le_bytes());
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes(&value.to_le_bytes());
+    }
+
+    fn bool(&mut self, value: bool) {
+        self.byte(value as u8);
+    }
+
+    fn f32(&mut self, value: f32) {
+        self.bytes(&value.to_bits().to_le_bytes());
+    }
+
+    /// Строка с терминатором, чтобы `("a","bc")` и `("ab","c")` различались.
+    fn str(&mut self, text: &str) {
+        self.bytes(text.as_bytes());
+        self.byte(0xff);
+    }
+}
+
+impl Default for Signature {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Settings {
+    /// Дешёвый отпечаток состояния, из которого строится документ.
+    ///
+    /// Сравнивать `Settings` на каждом кадре дорого: `from_model` собирает
+    /// десяток `String`, hex-ключи и список недавних файлов. Кадр вместо этого
+    /// считает FNV-отпечаток по тем же полям (без единой аллокации) и строит
+    /// документ только когда отпечаток изменился. Флаг «грязно», который
+    /// пришлось бы ставить в каждом мутаторе модели, здесь не нужен: забыть
+    /// обновить отпечаток невозможно, он считается из самого состояния.
+    pub fn signature(model: &Model, window: Option<(u32, u32)>, maximized: bool) -> u64 {
+        let mut h = Signature::default();
+        let params = &model.params;
+
+        h.str(mode_key(model.mode));
+        h.u32(params.width);
+        h.str(filter_key(params.filter));
+        h.u16(params.colors);
+        h.u32(params.cell);
+        h.u8(params.grid_opacity);
+        h.bytes(&params.grid_color);
+        h.u8(params.alpha_threshold);
+        h.bool(params.fill_enabled);
+        h.bytes(&params.fill_color);
+        h.u32(params.despeckle);
+
+        h.bool(params.remove_bg);
+        h.bool(params.bg_auto_color);
+        h.bytes(&params.bg_color);
+        h.u8(params.bg_tolerance);
+        h.u32(params.bg_grow);
+        h.bool(params.bg_auto_defringe);
+        h.u32(params.bg_defringe);
+        h.bool(params.thin_gaps);
+        h.bool(params.remove_holes);
+        h.f32(params.hole_area_pct);
+
+        match &model.output.dir {
+            Some(dir) => h.bytes(dir.as_os_str().as_encoded_bytes()),
+            None => h.u8(0),
+        }
+        h.byte(0xfe);
+        match &model.output.prefix {
+            Some(prefix) => h.str(prefix),
+            None => h.u8(0),
+        }
+
+        match window {
+            Some((width, height)) => {
+                h.u32(width);
+                h.u32(height);
+            }
+            None => h.u8(0),
+        }
+        h.bool(maximized);
+
+        for path in &model.recent {
+            h.bytes(path.as_os_str().as_encoded_bytes());
+            h.byte(0xfe);
+        }
+
+        h.0
+    }
+
     /// Capture the current editor state.
     pub fn from_model(model: &Model, window: Option<(u32, u32)>, maximized: bool) -> Self {
         let params = &model.params;
@@ -521,5 +635,82 @@ mod tests {
 
         assert!(restored.window.maximized);
         assert_eq!(restored.window_size(), Some((1280, 800)));
+    }
+
+    /// Отпечаток совпадает у одинакового состояния и меняется от любого
+    /// параметра, который попадает в документ: иначе кадр «не заметит»
+    /// изменение и настройки не сохранятся.
+    #[test]
+    fn signature_tracks_changes() {
+        let mut model = Model::new();
+        let window = Some((1280u32, 800u32));
+        let base = Settings::signature(&model, window, false);
+
+        assert_eq!(
+            base,
+            Settings::signature(&model, window, false),
+            "одинаковое состояние — одинаковый отпечаток"
+        );
+        assert_ne!(
+            base,
+            Settings::signature(&model, window, true),
+            "максимизация входит в отпечаток"
+        );
+        assert_ne!(
+            base,
+            Settings::signature(&model, Some((1024, 768)), false),
+            "размер окна входит в отпечаток"
+        );
+
+        let changes: [(&str, fn(&mut Model)); 6] = [
+            ("ширина сетки", |m| m.params.width += 1),
+            ("число цветов", |m| m.params.colors += 1),
+            ("ячейка", |m| m.params.cell += 1),
+            ("прозрачность сетки", |m| m.params.grid_opacity += 1),
+            ("вырезание фона", |m| m.params.remove_bg = !m.params.remove_bg),
+            ("префикс вывода", |m| {
+                m.output.prefix = Some("новый".to_string())
+            }),
+        ];
+        for (label, change) in changes {
+            let mut changed = Model::new();
+            change(&mut changed);
+            assert_ne!(
+                base,
+                Settings::signature(&changed, window, false),
+                "изменение «{label}» обязано менять отпечаток"
+            );
+        }
+
+        // Тот же документ на выходе тоже даёт другой отпечаток: список недавних.
+        model.recent.push(std::path::PathBuf::from("/tmp/фото.jpg"));
+        assert_ne!(base, Settings::signature(&model, window, false));
+    }
+
+    /// Сохранённый и восстановленный документ совпадает с тем, что модель
+    /// отдаёт в этот момент (без потерь полей при сериализации).
+    #[test]
+    fn snapshot_equals_after_save() {
+        let mut model = Model::new();
+        model.params.width = 96;
+        model.params.colors = 24;
+        model.params.remove_bg = true;
+        model.params.thin_gaps = true;
+        model.output.prefix = Some("вид".to_string());
+        model
+            .recent
+            .push(std::path::PathBuf::from("/tmp/один.png"));
+
+        let window = Some((1180u32, 720u32));
+        let settings = Settings::from_model(&model, window, false);
+        let text = serde_json::to_string(&settings).expect("serialize");
+        let restored: Settings = serde_json::from_str(&text).expect("deserialize");
+
+        assert_eq!(restored, settings, "документ переживает сериализацию");
+        assert_eq!(
+            restored,
+            Settings::from_model(&model, window, false),
+            "и совпадает с моделью"
+        );
     }
 }
