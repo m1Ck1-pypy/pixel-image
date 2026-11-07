@@ -114,6 +114,11 @@ cargo build --release
 Релизный профиль настроен на скорость: `opt-level = 3`, `lto = "fat"`,
 `codegen-units = 1`, `panic = "abort"`, `strip = true`.
 
+Тяжёлые участки конвейера идут параллельно по строкам через `rayon`; число
+потоков можно ограничить переменной `RAYON_NUM_THREADS` (`=1` — последовательный
+режим, результат побайтово тот же). Свежие цифры по времени и памяти — в
+[docs/performance.md](docs/performance.md).
+
 Тесты:
 
 ```powershell
