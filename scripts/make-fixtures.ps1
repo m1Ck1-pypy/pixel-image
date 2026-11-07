@@ -111,4 +111,20 @@ Save-Jpeg (New-PhotoLike -Width 6000 -Height 4000 -Seed 11 -Shapes 500) (Join-Pa
 Save-Jpeg (New-PhotoLike -Width 4000 -Height 3000 -Seed 23 -Shapes 320) (Join-Path $dir 'photo-12mp.jpg')
 Save-Png (New-AlphaCutout -Width 1440 -Height 2160) (Join-Path $dir 'cutout-alpha.png')
 
+# Маленькая фикстура — копия test.jpg из корня: CLI пишет результаты рядом с
+# входным файлом, поэтому вход для замеров должен лежать в out/bench, иначе
+# бенчмарк засоряет корень репозитория.
+$smallSource = Join-Path $root 'test.jpg'
+if (Test-Path $smallSource) {
+    $smallDest = Join-Path $dir 'small.jpg'
+    if ($Force -or -not (Test-Path $smallDest)) {
+        Copy-Item $smallSource $smallDest -Force
+        Write-Host "скопировано: $smallDest"
+    } else {
+        Write-Host "уже есть: $smallDest"
+    }
+} else {
+    Write-Warning "нет $smallSource — сценарий 'pixel-art small' будет пропущен"
+}
+
 Write-Host "фикстуры в $dir"

@@ -41,19 +41,33 @@ impl Filter {
     }
 }
 
+/// Обратное деление премультиплицированного цвета на альфу.
+#[inline]
+fn unpremultiply(v: u8, a: u32) -> u8 {
+    // при a == 0 checked_div даёт None -> цвет 0 у прозрачного пикселя
+    ((v as u32 * 255 + a / 2).checked_div(a))
+        .unwrap_or_default()
+        .min(255) as u8
+}
+
 /// Фильтры из `image` с premultiplied alpha: цвет и альфа уменьшаются раздельно,
 /// затем цвет делится обратно на альфу.
 fn downscale_resize(src: &RgbaImage, gw: u32, gh: u32, ft: FilterType) -> RgbaImage {
     let (w, h) = src.dimensions();
     let n = w as usize * h as usize;
-    let mut pre = Vec::with_capacity(n * 3);
-    let mut al = Vec::with_capacity(n);
-    for p in src.as_raw().as_chunks::<4>().0 {
-        let a = p[3] as u32;
-        for &v in p.iter().take(3) {
-            pre.push(((v as u32 * a + 127) / 255) as u8);
-        }
-        al.push(p[3]);
+
+    let mut pre = vec![0u8; n * 3];
+    let mut al = vec![0u8; n];
+    for ((dst, alpha), px) in pre
+        .chunks_exact_mut(3)
+        .zip(al.iter_mut())
+        .zip(src.as_raw().as_chunks::<4>().0.iter())
+    {
+        let a = px[3] as u32;
+        dst[0] = ((px[0] as u32 * a + 127) / 255) as u8;
+        dst[1] = ((px[1] as u32 * a + 127) / 255) as u8;
+        dst[2] = ((px[2] as u32 * a + 127) / 255) as u8;
+        *alpha = px[3];
     }
     let pre = RgbImage::from_raw(w, h, pre).expect("размер буфера");
     let al = GrayImage::from_raw(w, h, al).expect("размер буфера");
@@ -61,18 +75,17 @@ fn downscale_resize(src: &RgbaImage, gw: u32, gh: u32, ft: FilterType) -> RgbaIm
     let pre_s = image::imageops::resize(&pre, gw, gh, ft);
     let al_s = image::imageops::resize(&al, gw, gh, ft);
 
-    let mut out = Vec::with_capacity(gw as usize * gh as usize * 4);
-    for (c, a) in pre_s.as_raw().as_chunks::<3>().0.iter().zip(al_s.as_raw()) {
-        let a32 = *a as u32;
-        for &v in c.iter() {
-            // при a32 == 0 checked_div даёт None -> цвет 0 у прозрачного пикселя
-            out.push(
-                ((v as u32 * 255 + a32 / 2).checked_div(a32))
-                    .unwrap_or_default()
-                    .min(255) as u8,
-            );
-        }
-        out.push(*a);
+    let mut out = vec![0u8; gw as usize * gh as usize * 4];
+    for ((dst, c), &a) in out
+        .chunks_exact_mut(4)
+        .zip(pre_s.as_raw().as_chunks::<3>().0.iter())
+        .zip(al_s.as_raw().iter())
+    {
+        let a32 = a as u32;
+        dst[0] = unpremultiply(c[0], a32);
+        dst[1] = unpremultiply(c[1], a32);
+        dst[2] = unpremultiply(c[2], a32);
+        dst[3] = a;
     }
     RgbaImage::from_raw(gw, gh, out).expect("размер буфера")
 }
@@ -84,7 +97,8 @@ fn downscale_resize(src: &RgbaImage, gw: u32, gh: u32, ft: FilterType) -> RgbaIm
 fn downscale_blocks(src: &RgbaImage, gw: u32, gh: u32, mode: bool) -> RgbaImage {
     let (w, h) = src.dimensions();
     let raw = src.as_raw();
-    let mut out = Vec::with_capacity(gw as usize * gh as usize * 4);
+    let mut out = vec![0u8; gw as usize * gh as usize * 4];
+    let mut cells = out.chunks_exact_mut(4);
     // группа -> [число пикселей, сумма R, сумма G, сумма B]
     let mut buckets: HashMap<u16, [u32; 4]> = HashMap::new();
 
@@ -154,7 +168,8 @@ fn downscale_blocks(src: &RgbaImage, gw: u32, gh: u32, mode: bool) -> RgbaImage 
                         .unwrap_or_default()) as u8,
                 ]
             };
-            out.extend_from_slice(&[color[0], color[1], color[2], alpha]);
+            let cell = cells.next().expect("ячеек столько же, сколько блоков");
+            cell.copy_from_slice(&[color[0], color[1], color[2], alpha]);
         }
     }
     RgbaImage::from_raw(gw, gh, out).expect("размер буфера")
@@ -168,5 +183,127 @@ pub fn apply_alpha_threshold(img: &mut RgbaImage, threshold: u8) {
         } else {
             p.copy_from_slice(&[0, 0, 0, 0]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Эталон: прежняя реализация на `push`. Нужна как оракул для проверки
+    /// чанкового варианта: арифметика обязана остаться той же.
+    fn downscale_resize_reference(src: &RgbaImage, gw: u32, gh: u32, ft: FilterType) -> RgbaImage {
+        let (w, h) = src.dimensions();
+        let n = w as usize * h as usize;
+        let mut pre = Vec::with_capacity(n * 3);
+        let mut al = Vec::with_capacity(n);
+        for p in src.as_raw().as_chunks::<4>().0 {
+            let a = p[3] as u32;
+            for &v in p.iter().take(3) {
+                pre.push(((v as u32 * a + 127) / 255) as u8);
+            }
+            al.push(p[3]);
+        }
+        let pre = RgbImage::from_raw(w, h, pre).expect("размер буфера");
+        let al = GrayImage::from_raw(w, h, al).expect("размер буфера");
+
+        let pre_s = image::imageops::resize(&pre, gw, gh, ft);
+        let al_s = image::imageops::resize(&al, gw, gh, ft);
+
+        let mut out = Vec::with_capacity(gw as usize * gh as usize * 4);
+        for (c, a) in pre_s.as_raw().as_chunks::<3>().0.iter().zip(al_s.as_raw()) {
+            let a32 = *a as u32;
+            for &v in c.iter() {
+                out.push(
+                    ((v as u32 * 255 + a32 / 2).checked_div(a32))
+                        .unwrap_or_default()
+                        .min(255) as u8,
+                );
+            }
+            out.push(*a);
+        }
+        RgbaImage::from_raw(gw, gh, out).expect("размер буфера")
+    }
+
+    /// Фикстура с полупрозрачной каймой и полностью прозрачным углом.
+    fn sprite_fixture(w: u32, h: u32, seed: u32) -> RgbaImage {
+        let mut buf = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let edge = x < w / 4 && y < h / 4;
+                let alpha = if edge {
+                    0
+                } else if (x + y + seed) % 5 == 0 {
+                    128
+                } else {
+                    255
+                };
+                buf.extend_from_slice(&[
+                    ((x * 13 + seed) % 256) as u8,
+                    ((y * 7 + seed * 3) % 256) as u8,
+                    ((x * y + 90) % 256) as u8,
+                    alpha,
+                ]);
+            }
+        }
+        RgbaImage::from_raw(w, h, buf).expect("фикстура")
+    }
+
+    #[test]
+    fn filter_output_unchanged() {
+        let fixtures = [(32u32, 24u32, 1u32), (17, 9, 2), (64, 48, 3)];
+        let filters = [
+            FilterType::Lanczos3,
+            FilterType::CatmullRom,
+            FilterType::Triangle,
+            FilterType::Gaussian,
+            FilterType::Nearest,
+        ];
+        let targets = [(8u32, 8u32), (16, 12), (40, 30)];
+
+        for &(w, h, seed) in &fixtures {
+            let src = sprite_fixture(w, h, seed);
+            for &ft in &filters {
+                for &(gw, gh) in &targets {
+                    let got = downscale_resize(&src, gw, gh, ft);
+                    let want = downscale_resize_reference(&src, gw, gh, ft);
+                    assert_eq!(
+                        got.dimensions(),
+                        want.dimensions(),
+                        "{w}x{h} -> {gw}x{gh}, {ft:?}"
+                    );
+                    assert_eq!(
+                        got.as_raw(),
+                        want.as_raw(),
+                        "пиксели: {w}x{h} -> {gw}x{gh}, {ft:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Блочные фильтры (box/mode) не ходят через `pre`/`al` — проверяем, что
+    /// их результат не зависит от чанковой упаковки.
+    #[test]
+    fn block_filters_unchanged() {
+        let src = sprite_fixture(48, 36, 5);
+        for filter in [Filter::Box, Filter::Mode] {
+            let a = filter.downscale(&src, 12, 9);
+            let b = filter.downscale(&src, 12, 9);
+            assert_eq!(a.as_raw(), b.as_raw(), "повторный вызов {filter:?}");
+        }
+    }
+
+    #[test]
+    fn alpha_threshold_zeroes_low_alpha() {
+        let mut img = RgbaImage::from_raw(
+            2,
+            1,
+            vec![10, 20, 30, 100, 40, 50, 60, 200],
+        )
+        .expect("фикстура");
+        apply_alpha_threshold(&mut img, 128);
+        assert_eq!(img.get_pixel(0, 0).0, [0, 0, 0, 0]);
+        assert_eq!(img.get_pixel(1, 0).0, [40, 50, 60, 255]);
     }
 }

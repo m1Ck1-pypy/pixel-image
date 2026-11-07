@@ -30,12 +30,17 @@ pub fn detect_background(rgba: &[u8], w: usize, h: usize) -> [u8; 3] {
 }
 
 /// Расстояние от пикселя до цвета фона: наибольшая разница по каналам.
+/// `px` — первые три байта RGBA-пикселя (альфа не учитывается).
+#[inline]
+fn dist_px(px: &[u8], bg: [u8; 3]) -> u8 {
+    let d = |a: u8, b: u8| a.abs_diff(b);
+    d(px[0], bg[0]).max(d(px[1], bg[1])).max(d(px[2], bg[2]))
+}
+
+/// То же, но по индексу начала пикселя в сыром буфере.
 #[inline]
 fn dist(rgba: &[u8], i: usize, bg: [u8; 3]) -> u8 {
-    let d = |a: u8, b: u8| a.abs_diff(b);
-    d(rgba[i], bg[0])
-        .max(d(rgba[i + 1], bg[1]))
-        .max(d(rgba[i + 2], bg[2]))
+    dist_px(&rgba[i..], bg)
 }
 
 /// Пиксель считается фоном, если он прозрачный или цвет в пределах `tol` от `bg`.
@@ -179,13 +184,12 @@ pub fn remove_background(
     }
 
     let mut removed = 0;
-    for (p, g) in gone.iter().enumerate() {
+    for (g, px) in gone.iter().zip(rgba.chunks_exact_mut(4)) {
         if *g {
-            let i = p * 4;
-            if rgba[i + 3] != 0 {
+            if px[3] != 0 {
                 removed += 1;
             }
-            rgba[i..i + 4].copy_from_slice(&[0, 0, 0, 0]);
+            px.copy_from_slice(&[0, 0, 0, 0]);
         }
     }
     removed
@@ -213,8 +217,9 @@ pub fn remove_thin_pockets(
         return 0;
     }
     let n = w * h;
-    let near: Vec<bool> = (0..n)
-        .map(|p| rgba[p * 4 + 3] != 0 && dist(rgba, p * 4, bg) <= tol)
+    let near: Vec<bool> = rgba
+        .chunks_exact(4)
+        .map(|px| px[3] != 0 && dist_px(px, bg) <= tol)
         .collect();
     let neighbors = |p: usize| {
         let (x, y) = (p % w, p / w);

@@ -553,24 +553,23 @@ pub fn output_path(input: &Path, prefix: Option<&str>, suffix: &str) -> PathBuf 
 pub fn save_png(img: &RgbaImage, fill: Option<Color>, path: &Path) -> Result<()> {
     let (w, h) = img.dimensions();
     let raw = img.as_raw();
+    let pixels = raw.as_chunks::<4>().0;
     if let Some(bg) = fill {
-        let mut out = Vec::with_capacity(w as usize * h as usize * 3);
-        for p in raw.as_chunks::<4>().0 {
+        let mut out = vec![0u8; w as usize * h as usize * 3];
+        for (dst, p) in out.chunks_exact_mut(3).zip(pixels.iter()) {
             let a = p[3] as u32;
             for c in 0..3 {
-                out.push(((p[c] as u32 * a + bg[c] as u32 * (255 - a) + 127) / 255) as u8);
+                dst[c] = ((p[c] as u32 * a + bg[c] as u32 * (255 - a) + 127) / 255) as u8;
             }
         }
         RgbImage::from_raw(w, h, out)
             .ok_or_else(|| Error::msg("размер буфера"))?
             .save(path)?;
-    } else if raw.as_chunks::<4>().0.iter().all(|p| p[3] == 255) {
-        let out: Vec<u8> = raw
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .flat_map(|p| [p[0], p[1], p[2]])
-            .collect();
+    } else if pixels.iter().all(|p| p[3] == 255) {
+        let mut out = vec![0u8; w as usize * h as usize * 3];
+        for (dst, p) in out.chunks_exact_mut(3).zip(pixels.iter()) {
+            dst.copy_from_slice(&p[..3]);
+        }
         RgbImage::from_raw(w, h, out)
             .ok_or_else(|| Error::msg("размер буфера"))?
             .save(path)?;
@@ -578,4 +577,92 @@ pub fn save_png(img: &RgbaImage, fill: Option<Color>, path: &Path) -> Result<()>
         img.save(path)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_path(name: &str) -> PathBuf {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "pixel-image-test-{}-{seq}-{name}.png",
+            std::process::id()
+        ))
+    }
+
+    /// Цветовой тип PNG из байтов IHDR: 2 = RGB, 6 = RGBA.
+    fn png_color_type(path: &Path) -> u8 {
+        let bytes = std::fs::read(path).expect("файл записан");
+        // сигнатура (8) + длина (4) + "IHDR" (4) + width (4) + height (4) + bit depth (1)
+        bytes[25]
+    }
+
+    fn read_back(path: &Path) -> RgbaImage {
+        image::open(path)
+            .expect("обратное чтение PNG")
+            .into_rgba8()
+    }
+
+    #[test]
+    fn save_png_opaque_writes_rgb() {
+        let img = RgbaImage::from_raw(
+            3,
+            1,
+            vec![10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255],
+        )
+        .expect("фикстура");
+        let path = temp_path("opaque");
+
+        save_png(&img, None, &path).expect("запись");
+        assert_eq!(png_color_type(&path), 2, "непрозрачная картинка — RGB");
+        assert_eq!(read_back(&path).as_raw(), img.as_raw());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn save_png_transparent_writes_rgba() {
+        let img =
+            RgbaImage::from_raw(2, 1, vec![10, 20, 30, 255, 40, 50, 60, 0]).expect("фикстура");
+        let path = temp_path("rgba");
+
+        save_png(&img, None, &path).expect("запись");
+        assert_eq!(png_color_type(&path), 6, "есть прозрачность — RGBA");
+        assert_eq!(read_back(&path).as_raw(), img.as_raw());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn save_png_fill_composites_over_background() {
+        let img = RgbaImage::from_raw(
+            3,
+            1,
+            vec![10, 20, 30, 128, 40, 50, 60, 0, 70, 80, 90, 255],
+        )
+        .expect("фикстура");
+        let bg: Color = [255, 255, 255];
+        let path = temp_path("fill");
+
+        save_png(&img, Some(bg), &path).expect("запись");
+        assert_eq!(png_color_type(&path), 2, "с заливкой — RGB");
+
+        let got = read_back(&path);
+        let raw = img.as_raw();
+        for (i, p) in raw.as_chunks::<4>().0.iter().enumerate() {
+            let a = p[3] as u32;
+            let want: Vec<u8> = (0..3)
+                .map(|c| ((p[c] as u32 * a + bg[c] as u32 * (255 - a) + 127) / 255) as u8)
+                .collect();
+            let px = got.get_pixel(i as u32, 0).0;
+            assert_eq!(&px[..3], want.as_slice(), "пиксель {i}");
+            assert_eq!(px[3], 255, "альфа после заливки {i}");
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
 }

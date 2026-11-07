@@ -54,7 +54,8 @@ if (-not (Test-Path $benchDir)) {
 $big = Join-Path $benchDir 'photo-24mp.jpg'
 $mid = Join-Path $benchDir 'photo-12mp.jpg'
 $alpha = Join-Path $benchDir 'cutout-alpha.png'
-foreach ($fixture in @($big, $mid, $alpha)) {
+$small = Join-Path $benchDir 'small.jpg'
+foreach ($fixture in @($big, $mid, $alpha, $small)) {
     if (-not (Test-Path $fixture)) {
         throw "нет фикстуры $fixture — запустите: pwsh -File scripts/make-fixtures.ps1"
     }
@@ -78,7 +79,7 @@ $Scenarios = @(
     @{ Name = 'cutout 24mp all';    Args = @($big, '--cutbg', '--thin-gaps', '--remove-holes') }
     @{ Name = 'cutout alpha png';   Args = @($alpha, '--cutbg') }
     @{ Name = 'pixel-art 12mp';     Args = @($mid) }
-    @{ Name = 'pixel-art small';    Args = @((Join-Path $root 'test.jpg')) }
+    @{ Name = 'pixel-art small';    Args = @($small) }
 )
 
 function Invoke-Once {
