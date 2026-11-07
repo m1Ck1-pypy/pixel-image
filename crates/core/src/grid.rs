@@ -1,7 +1,9 @@
 use image::RgbaImage;
+use rayon::prelude::*;
 
 use crate::color::Color;
 use crate::error::{Error, Result};
+use crate::parallel;
 
 /// Накладывает цвет сетки с непрозрачностью `ga` (0..=255) на пиксель (source-over).
 #[inline]
@@ -54,7 +56,18 @@ pub fn upscale_with_grid(
     let stride = out_w as usize * 4;
     let mut buf = vec![0u8; total]; // нули = полностью прозрачный пиксель
 
-    for gy in 0..h as usize {
+    // Полоса = все выходные строки одной строки сетки. Пишет её ровно один
+    // поток, поэтому параллель по полосам даёт те же байты, что и последовательный
+    // обход: порядок записи меняется, а содержимое каждой строки — нет.
+    let band = stride * cell_us;
+
+    if band == 0 || buf.len() != h as usize * band {
+        // Пустой спрайт или нулевая ячейка: писать нечего.
+        return RgbaImage::from_raw(out_w, out_h, buf)
+            .ok_or_else(|| Error::msg("ошибка сборки изображения"));
+    }
+
+    let write_band = |gy: usize, rows: &mut [u8]| {
         for gx in 0..w_us {
             let (xi, yi) = (gx as i64, gy as i64);
             let me = solid(xi, yi);
@@ -96,8 +109,8 @@ pub fn upscale_with_grid(
 
             let col = gx * cell_us;
             for dy in 0..cell_us {
-                let row_start = (gy * cell_us + dy) * stride;
-                let row = &mut buf[row_start..row_start + stride];
+                let row_start = dy * stride;
+                let row = &mut rows[row_start..row_start + stride];
                 let (head, tail) = row[col * 4..(col + cell_us) * 4].split_at_mut(4);
                 let (first, fill) = if dy == 0 {
                     (top_left, top)
@@ -109,6 +122,16 @@ pub fn upscale_with_grid(
                     px.copy_from_slice(&fill);
                 }
             }
+        }
+    };
+
+    if parallel::should_parallel(out_w as usize * out_h as usize) && h > 1 {
+        buf.par_chunks_mut(band)
+            .enumerate()
+            .for_each(|(gy, rows)| write_band(gy, rows));
+    } else {
+        for (gy, rows) in buf.chunks_mut(band).enumerate() {
+            write_band(gy, rows);
         }
     }
     // Правая и нижняя внешняя граница сетки (линии справа/снизу от крайних ячеек)

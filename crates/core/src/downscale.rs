@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
 use image::{GrayImage, RgbImage, RgbaImage, imageops::FilterType};
+use rayon::prelude::*;
 
 use crate::color::Color;
+use crate::parallel;
 
 /// Способ уменьшения изображения до сетки.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,14 +111,22 @@ fn downscale_blocks(src: &RgbaImage, gw: u32, gh: u32, mode: bool, faint: u8) ->
     let (w, h) = src.dimensions();
     let raw = src.as_raw();
     let mut out = vec![0u8; gw as usize * gh as usize * 4];
-    let mut cells = out.chunks_exact_mut(4);
-    // группа -> [число пикселей, сумма R, сумма G, сумма B]
-    let mut buckets: HashMap<u16, [u32; 4]> = HashMap::new();
+    if gw == 0 || gh == 0 {
+        return RgbaImage::from_raw(gw, gh, out).expect("размер буфера");
+    }
+    let row_cells = gw as usize * 4;
 
-    for gy in 0..gh {
+    // Строка блоков независима от соседних: у каждого блока свои границы, свой
+    // аккумулятор и своя ячейка выхода. Поэтому блоки можно раздать потокам без
+    // изменения результата (в т.ч. «самый частый цвет» с тай-брейком по ключу).
+    let write_row = |gy: u32, cells: &mut [u8]| {
+        // группа -> [число пикселей, сумма R, сумма G, сумма B]
+        let mut buckets: HashMap<u16, [u32; 4]> = HashMap::new();
         let y0 = (gy as u64 * h as u64 / gh as u64) as u32;
         let y1 = (((gy as u64 + 1) * h as u64 / gh as u64) as u32).clamp(y0 + 1, h);
-        for gx in 0..gw {
+
+        for (gx, cell) in cells.chunks_exact_mut(4).enumerate() {
+            let gx = gx as u32;
             let x0 = (gx as u64 * w as u64 / gw as u64) as u32;
             let x1 = (((gx as u64 + 1) * w as u64 / gw as u64) as u32).clamp(x0 + 1, w);
 
@@ -184,16 +194,38 @@ fn downscale_blocks(src: &RgbaImage, gw: u32, gh: u32, mode: bool, faint: u8) ->
                         .unwrap_or_default()) as u8,
                 ]
             };
-            let cell = cells.next().expect("ячеек столько же, сколько блоков");
             cell.copy_from_slice(&[color[0], color[1], color[2], alpha]);
+        }
+    };
+
+    if gh > 1 && parallel::should_parallel(w as usize * h as usize) {
+        out.par_chunks_mut(row_cells)
+            .enumerate()
+            .for_each(|(gy, cells)| write_row(gy as u32, cells));
+    } else {
+        for (gy, cells) in out.chunks_mut(row_cells).enumerate() {
+            write_row(gy as u32, cells);
         }
     }
     RgbaImage::from_raw(gw, gh, out).expect("размер буфера")
 }
 
+
 /// Делает прозрачность бинарной: альфа >= порога -> непрозрачный, иначе прозрачный.
 pub fn apply_alpha_threshold(img: &mut RgbaImage, threshold: u8) {
-    for p in img.as_mut().as_chunks_mut::<4>().0 {
+    let width = img.width() as usize;
+    let raw = img.as_mut();
+    if width == 0 || !parallel::should_parallel(raw.len() / 4) {
+        threshold_rows(raw, threshold);
+        return;
+    }
+    // Строки независимы: каждый поток правит свою, порядок обхода на байты не влияет.
+    raw.par_chunks_mut(width * 4)
+        .for_each(|row| threshold_rows(row, threshold));
+}
+
+fn threshold_rows(raw: &mut [u8], threshold: u8) {
+    for p in raw.as_chunks_mut::<4>().0 {
         if p[3] >= threshold {
             p[3] = 255;
         } else {
@@ -201,6 +233,7 @@ pub fn apply_alpha_threshold(img: &mut RgbaImage, threshold: u8) {
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {

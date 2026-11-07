@@ -6,3 +6,8 @@ description = "Image pipeline: pixel-art conversion and background cutout"
 
 [dependencies]
 image.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+# Параллельные API проверяются в `tests/parity.rs` на разных размерах пула.
+rayon.workspace = true

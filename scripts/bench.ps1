@@ -64,9 +64,11 @@ foreach ($fixture in @($big, $mid, $alpha, $small)) {
 # Пороги — медианы этапа 0 (см. optimaze.md, §2). Проверка в -Check добавляет
 # к ним ещё 10%, поэтому эффективный запас ~10% по памяти и ~25% по времени.
 # Память: WsMb/CommitMb — пик процесса. Время: Ms — общая длительность запуска.
+# Этап 3 (rayon) сжал «pixel-art 24mp box» с 138 до ~90 мс — порог времени
+# уменьшен следом (память не изменилась, её не трогали).
 $Thresholds = [ordered]@{
     'pixel-art 24mp'     = @{ WsMb = 196.4; CommitMb = 193.9; Ms = 630 }
-    'pixel-art 24mp box' = @{ WsMb = 165.7; CommitMb = 163.1; Ms = 160 }
+    'pixel-art 24mp box' = @{ WsMb = 165.7; CommitMb = 163.1; Ms = 115 }
     'cutout 24mp all'    = @{ WsMb = 231.1; CommitMb = 329.9; Ms = 410 }
     'cutout alpha png'   = @{ WsMb = 53.0;  CommitMb = 52.9;  Ms = 70 }
     'pixel-art 12mp'     = @{ WsMb = 102.6; CommitMb = 99.6;  Ms = 340 }

@@ -150,6 +150,9 @@ impl Worker {
         let (result_tx, result_rx) = mpsc::channel::<WorkerResult>();
 
         let thread = thread::spawn(move || {
+            // Пул потоков поднимаем в воркере: генерации сериализованы каналом,
+            // поэтому первый тяжёлый кадр не должен платить за запуск потоков.
+            pixel_image_core::parallel::init();
             while let Ok(job) = job_rx.recv() {
                 let result = match job {
                     Job::Shutdown => break,

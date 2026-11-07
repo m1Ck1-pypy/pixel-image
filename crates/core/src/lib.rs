@@ -19,6 +19,7 @@ pub mod downscale;
 pub mod error;
 pub mod grid;
 pub mod palette;
+pub mod parallel;
 pub mod pipeline;
 
 pub use color::Color;

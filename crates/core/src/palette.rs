@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
 use image::RgbaImage;
+use rayon::prelude::*;
 
 use crate::color::{Color, key};
+use crate::parallel;
 
 #[derive(Clone, Copy)]
 pub struct Entry {
@@ -10,15 +12,56 @@ pub struct Entry {
     pub count: u32,
 }
 
-/// Уникальные цвета непрозрачных пикселей с количеством пикселей каждого цвета.
-pub fn histogram(img: &RgbaImage) -> Vec<Entry> {
-    let mut map: HashMap<u32, u32> = HashMap::new();
-    for p in img.as_raw().as_chunks::<4>().0 {
+/// Слияние двух гистограмм: суммы точные, поэтому порядок слияния не важен.
+fn merge(mut a: HashMap<u32, u32>, b: HashMap<u32, u32>) -> HashMap<u32, u32> {
+    // Меньшую карту вливаем в большую: меньше реаллокаций.
+    if a.len() < b.len() {
+        let mut large = b;
+        for (k, v) in a {
+            *large.entry(k).or_insert(0) += v;
+        }
+        large
+    } else {
+        for (k, v) in b {
+            *a.entry(k).or_insert(0) += v;
+        }
+        a
+    }
+}
+
+fn count_row(map: &mut HashMap<u32, u32>, row: &[[u8; 4]]) {
+    for p in row {
         if p[3] == 0 {
             continue; // прозрачные пиксели в палитру не попадают
         }
         *map.entry(key([p[0], p[1], p[2]])).or_insert(0) += 1;
     }
+}
+
+/// Уникальные цвета непрозрачных пикселей с количеством пикселей каждого цвета.
+///
+/// Гистограмма считается по строкам: каждый поток собирает свою карту, затем
+/// карты сливаются (суммы целые, порядок слияния на результат не влияет) и
+/// сортируются по ключу цвета. Поэтому порядок в `HashMap` не виден наружу.
+pub fn histogram(img: &RgbaImage) -> Vec<Entry> {
+    let (w, h) = img.dimensions();
+    let raw = img.as_raw().as_chunks::<4>().0;
+
+    let map = if w > 0 && h > 0 && parallel::should_parallel(raw.len()) {
+        raw.chunks(w as usize)
+            .collect::<Vec<_>>()
+            .par_iter()
+            .fold(HashMap::new, |mut acc, row| {
+                count_row(&mut acc, row);
+                acc
+            })
+            .reduce(HashMap::new, merge)
+    } else {
+        let mut map = HashMap::new();
+        count_row(&mut map, raw);
+        map
+    };
+
     let mut entries: Vec<Entry> = map
         .into_iter()
         .map(|(k, count)| Entry {
@@ -30,6 +73,7 @@ pub fn histogram(img: &RgbaImage) -> Vec<Entry> {
     entries.sort_unstable_by_key(|e| key(e.color));
     entries
 }
+
 
 /// Суммарное число пикселей коробки и взвешенная дисперсия (SSE) по каждому каналу:
 /// сумма count * (значение - среднее)^2. Учитывает и площадь цвета, и его удалённость.

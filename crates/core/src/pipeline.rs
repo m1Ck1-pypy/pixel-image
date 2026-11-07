@@ -11,6 +11,7 @@ use std::{
 };
 
 use image::{RgbImage, RgbaImage};
+use rayon::prelude::*;
 
 use crate::{
     clean,
@@ -19,6 +20,7 @@ use crate::{
     error::{Error, Result},
     grid::upscale_with_grid,
     palette::{Palette, histogram},
+    parallel,
 };
 
 /// Параметры удаления однотонного фона.
@@ -280,7 +282,7 @@ pub fn clean_source(src: &mut RgbaImage, background: Option<&BackgroundOptions>)
     let (w, h) = src.dimensions();
     let (wu, hu) = (w as usize, h as usize);
     let buf = src.as_mut();
-    let faint_alpha_removed = clean::cut_faint_alpha(buf, 16);
+    let faint_alpha_removed = cut_faint_alpha_blocked(buf, 16);
 
     let Some(bg_opts) = background else {
         return CleanStats {
@@ -335,14 +337,56 @@ pub fn clean_source(src: &mut RgbaImage, background: Option<&BackgroundOptions>)
 /// месте; теперь вырезание делает уменьшение (см. `Filter::downscale`).
 pub const FAINT_ALPHA: u8 = 16;
 
+/// Сколько байт в одном куске при параллельном отсечении слабой альфы.
+/// Кратно 4, чтобы кусок не разрезал пиксель.
+const FAINT_BLOCK: usize = 16 * 1024;
+
+/// Отсечение слабой альфы по крупным кускам.
+///
+/// Арифметика — ровно [`clean::cut_faint_alpha`], куски независимы, поэтому
+/// результат не зависит от их числа и порядка. Мелкие буферы (тестовые
+/// фикстуры 256×256) остаются на последовательном пути: параллель им не
+/// помогает, а тесты бюджета аллокаций не должны видеть чужой пул.
+fn cut_faint_alpha_blocked(rgba: &mut [u8], cut: u8) -> usize {
+    if rgba.len() <= FAINT_BLOCK || !parallel::should_parallel_bytes(rgba.len()) {
+        return clean::cut_faint_alpha(rgba, cut);
+    }
+    rgba.par_chunks_mut(FAINT_BLOCK)
+        .map(|block| clean::cut_faint_alpha(block, cut))
+        .sum()
+}
+
+/// Сумма `pred` по строкам шириной `per_row`; параллельно на больших объёмах.
+fn count_rows<T: Sync>(items: &[T], per_row: usize, pred: impl Fn(&T) -> bool + Sync) -> usize {
+    let count = |row: &[T]| row.iter().filter(|x| pred(x)).count();
+    if per_row == 0 || !parallel::should_parallel(items.len()) {
+        return count(items);
+    }
+    items.par_chunks(per_row).map(count).sum()
+}
+
 /// Сколько пикселей со слабой альфой есть в исходнике — для [`CleanStats`].
 fn count_faint_alpha(src: &RgbaImage) -> usize {
-    src.as_raw()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .filter(|p| p[3] != 0 && p[3] < FAINT_ALPHA)
-        .count()
+    let pixels = src.as_raw().as_chunks::<4>().0;
+    count_rows(pixels, src.width() as usize, |p| {
+        p[3] != 0 && p[3] < FAINT_ALPHA
+    })
+}
+
+/// Сколько ячеек полностью прозрачны, для [`Stats`].
+fn count_transparent(img: &RgbaImage) -> usize {
+    let pixels = img.as_raw().as_chunks::<4>().0;
+    count_rows(pixels, img.width() as usize, |p| p[3] == 0)
+}
+
+/// Замена цветов строки по таблице ближайших цветов палитры.
+fn remap_row(row: &mut [u8], remap: &HashMap<u32, Color>) {
+    for p in row.as_chunks_mut::<4>().0 {
+        if p[3] != 0 {
+            let c = remap[&key([p[0], p[1], p[2]])];
+            p[..3].copy_from_slice(&c);
+        }
+    }
 }
 
 /// Превращает RGBA-изображение в пиксель-арт, не трогая диск.
@@ -406,13 +450,7 @@ pub fn convert_image_timed(
         grid_h as usize,
         options.despeckle as usize,
     );
-    let transparent_cells = sprite
-        .as_raw()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .filter(|p| p[3] == 0)
-        .count();
+    let transparent_cells = count_transparent(&sprite);
     times.threshold = since(started);
 
     let started = Instant::now();
@@ -433,11 +471,15 @@ pub fn convert_image_timed(
         .map(|e| (key(e.color), palette.nearest(e.color)))
         .collect();
 
-    for p in sprite.as_mut().as_chunks_mut::<4>().0 {
-        if p[3] != 0 {
-            let c = remap[&key([p[0], p[1], p[2]])];
-            p[..3].copy_from_slice(&c);
-        }
+    let width = sprite.width() as usize;
+    let sprite_raw = sprite.as_mut();
+    if width > 0 && parallel::should_parallel(sprite_raw.len() / 4) {
+        // Каждый поток правит свои строки; таблица `remap` общая и только читается.
+        sprite_raw
+            .par_chunks_mut(width * 4)
+            .for_each(|row| remap_row(row, &remap));
+    } else {
+        remap_row(sprite_raw, &remap);
     }
     times.remap = since(started);
 
@@ -594,31 +636,72 @@ pub fn output_path(input: &Path, prefix: Option<&str>, suffix: &str) -> PathBuf 
 
 /// Сохраняет PNG: с заливкой фона, если задан `fill`; в RGB, если прозрачных
 /// пикселей нет; иначе в RGBA с сохранением прозрачности.
+///
+/// Композит и упаковка идут по строкам: строка не зависит от соседних, поэтому
+/// строки можно раздать потокам. Само сжатие PNG остаётся однопоточным —
+/// порядок блоков IDAT фиксирован.
 pub fn save_png(img: &RgbaImage, fill: Option<Color>, path: &Path) -> Result<()> {
     let (w, h) = img.dimensions();
     let raw = img.as_raw();
     let pixels = raw.as_chunks::<4>().0;
+    let width = (w as usize).max(1);
+    let parallel = parallel::should_parallel(pixels.len());
+
     if let Some(bg) = fill {
         let mut out = vec![0u8; w as usize * h as usize * 3];
-        for (dst, p) in out.chunks_exact_mut(3).zip(pixels.iter()) {
-            let a = p[3] as u32;
-            for c in 0..3 {
-                dst[c] = ((p[c] as u32 * a + bg[c] as u32 * (255 - a) + 127) / 255) as u8;
+        let row_bytes = (width * 3).max(1);
+        let composite = |src: &[[u8; 4]], dst: &mut [u8]| {
+            for (dst, p) in dst.chunks_exact_mut(3).zip(src) {
+                let a = p[3] as u32;
+                for c in 0..3 {
+                    dst[c] = ((p[c] as u32 * a + bg[c] as u32 * (255 - a) + 127) / 255) as u8;
+                }
+            }
+        };
+        if parallel {
+            pixels
+                .par_chunks(width)
+                .zip(out.par_chunks_mut(row_bytes))
+                .for_each(|(src, dst)| composite(src, dst));
+        } else {
+            for (src, dst) in pixels.chunks(width).zip(out.chunks_mut(row_bytes)) {
+                composite(src, dst);
             }
         }
         RgbImage::from_raw(w, h, out)
             .ok_or_else(|| Error::msg("размер буфера"))?
             .save(path)?;
-    } else if pixels.iter().all(|p| p[3] == 255) {
-        let mut out = vec![0u8; w as usize * h as usize * 3];
-        for (dst, p) in out.chunks_exact_mut(3).zip(pixels.iter()) {
-            dst.copy_from_slice(&p[..3]);
-        }
-        RgbImage::from_raw(w, h, out)
-            .ok_or_else(|| Error::msg("размер буфера"))?
-            .save(path)?;
     } else {
-        img.save(path)?;
+        let opaque = |row: &[[u8; 4]]| row.iter().all(|p| p[3] == 255);
+        let all_opaque = if parallel {
+            pixels.par_chunks(width).all(opaque)
+        } else {
+            pixels.chunks(width).all(opaque)
+        };
+        if all_opaque {
+            let mut out = vec![0u8; w as usize * h as usize * 3];
+            let row_bytes = (width * 3).max(1);
+            let pack = |src: &[[u8; 4]], dst: &mut [u8]| {
+                for (dst, p) in dst.chunks_exact_mut(3).zip(src) {
+                    dst.copy_from_slice(&p[..3]);
+                }
+            };
+            if parallel {
+                pixels
+                    .par_chunks(width)
+                    .zip(out.par_chunks_mut(row_bytes))
+                    .for_each(|(src, dst)| pack(src, dst));
+            } else {
+                for (src, dst) in pixels.chunks(width).zip(out.chunks_mut(row_bytes)) {
+                    pack(src, dst);
+                }
+            }
+            RgbImage::from_raw(w, h, out)
+                .ok_or_else(|| Error::msg("размер буфера"))?
+                .save(path)?;
+        } else {
+            img.save(path)?;
+        }
     }
     Ok(())
 }

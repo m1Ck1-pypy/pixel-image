@@ -35,6 +35,9 @@ fn main() {
     }
     let args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
+    // Потоки поднимаем заранее: иначе первый же кадр платит за их запуск.
+    pixel_image_core::parallel::init();
+
     // Опции уточнения фона требуют его удаления: --remove-bg или --cutbg.
     if (args.bg_color.is_some()
         || args.remove_holes
