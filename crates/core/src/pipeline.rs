@@ -278,7 +278,19 @@ pub struct SavedCutout {
 ///
 /// Меняет `src` на месте и возвращает счётчики. Если `background` = `None`,
 /// выполняется только отсечение слабой альфы.
+///
+/// Одноразовый вариант: создаёт свои буферы. Хосту с несколькими генерациями
+/// подряд (GUI-воркер) выгоднее [`clean_source_with_scratch`].
 pub fn clean_source(src: &mut RgbaImage, background: Option<&BackgroundOptions>) -> CleanStats {
+    clean_source_with_scratch(src, background, &mut clean::Scratch::default())
+}
+
+/// То же, что [`clean_source`], с переиспользуемыми буферами очистки.
+pub fn clean_source_with_scratch(
+    src: &mut RgbaImage,
+    background: Option<&BackgroundOptions>,
+    scratch: &mut clean::Scratch,
+) -> CleanStats {
     let (w, h) = src.dimensions();
     let (wu, hu) = (w as usize, h as usize);
     let buf = src.as_mut();
@@ -301,8 +313,16 @@ pub fn clean_source(src: &mut RgbaImage, background: Option<&BackgroundOptions>)
     } else {
         0
     };
-    let removed =
-        clean::remove_background(buf, wu, hu, bg, bg_opts.tolerance, bg_opts.grow, min_hole);
+    let removed = clean::remove_background_in(
+        buf,
+        wu,
+        hu,
+        bg,
+        bg_opts.tolerance,
+        bg_opts.grow,
+        min_hole,
+        scratch,
+    );
 
     let depth = bg_opts
         .defringe
@@ -313,11 +333,11 @@ pub fn clean_source(src: &mut RgbaImage, background: Option<&BackgroundOptions>)
         clean::auto_defringe_depth(wu, hu)
     };
     let thin_gaps_removed = if bg_opts.thin_gaps {
-        clean::remove_thin_pockets(buf, wu, hu, bg, bg_opts.tolerance, reach, 2)
+        clean::remove_thin_pockets_in(buf, wu, hu, bg, bg_opts.tolerance, reach, 2, scratch)
     } else {
         0
     };
-    let defringe_changed = clean::defringe(buf, wu, hu, bg, depth);
+    let defringe_changed = clean::defringe_in(buf, wu, hu, bg, depth, scratch);
 
     CleanStats {
         faint_alpha_removed,
@@ -398,12 +418,30 @@ pub fn convert_image(src: &RgbaImage, options: &Options) -> Result<Conversion> {
     convert_image_timed(src, options).map(|(conversion, _)| conversion)
 }
 
+/// То же, что [`convert_image`], с переиспользуемыми буферами очистки.
+pub fn convert_image_with_scratch(
+    src: &RgbaImage,
+    options: &Options,
+    scratch: &mut clean::Scratch,
+) -> Result<Conversion> {
+    convert_image_timed_scratch(src, options, scratch).map(|(conversion, _)| conversion)
+}
+
 /// То же, что [`convert_image`], но возвращает и время по этапам.
 ///
 /// Нужно для `--verbose` в CLI: ядро само ничего не печатает.
 pub fn convert_image_timed(
     src: &RgbaImage,
     options: &Options,
+) -> Result<(Conversion, StageTimes)> {
+    convert_image_timed_scratch(src, options, &mut clean::Scratch::default())
+}
+
+/// [`convert_image_timed`] с переиспользуемыми буферами очистки.
+pub fn convert_image_timed_scratch(
+    src: &RgbaImage,
+    options: &Options,
+    scratch: &mut clean::Scratch,
 ) -> Result<(Conversion, StageTimes)> {
     options.validate()?;
     let mut times = StageTimes::default();
@@ -414,7 +452,7 @@ pub fn convert_image_timed(
     let (clean_stats, working) = match options.background_removal.as_ref() {
         Some(background) => {
             let mut copy = src.clone();
-            let stats = clean_source(&mut copy, Some(background));
+            let stats = clean_source_with_scratch(&mut copy, Some(background), scratch);
             (stats, Cow::Owned(copy))
         }
         None => (
@@ -572,9 +610,18 @@ pub fn convert_file(
 }
 
 /// Вырезает фон из RGBA-изображения, не трогая диск.
-pub fn cutout_image(mut src: RgbaImage, background: &BackgroundOptions) -> Result<Cutout> {
-    let stats = clean_source(&mut src, Some(background));
-    let fully_transparent = src.as_raw().as_chunks::<4>().0.iter().all(|p| p[3] == 0);
+pub fn cutout_image(src: RgbaImage, background: &BackgroundOptions) -> Result<Cutout> {
+    cutout_image_with_scratch(src, background, &mut clean::Scratch::default())
+}
+
+/// То же, что [`cutout_image`], с переиспользуемыми буферами очистки.
+pub fn cutout_image_with_scratch(
+    mut src: RgbaImage,
+    background: &BackgroundOptions,
+    scratch: &mut clean::Scratch,
+) -> Result<Cutout> {
+    let stats = clean_source_with_scratch(&mut src, Some(background), scratch);
+    let fully_transparent = count_transparent(&src) == src.width() as usize * src.height() as usize;
     Ok(Cutout {
         image: src,
         stats,

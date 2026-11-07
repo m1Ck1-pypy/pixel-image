@@ -49,6 +49,128 @@ fn is_bg(rgba: &[u8], i: usize, bg: [u8; 3], tol: u8) -> bool {
     rgba[i + 3] == 0 || dist(rgba, i, bg) <= tol
 }
 
+/// Плотная маска пикселей: один бит на пиксель.
+///
+/// Заменяет `Vec<bool>` (байт на пиксель): на 24 Мп это 0.75 МБ вместо 6 МБ на
+/// каждую маску, а `reset` затирает только реально используемые слова. Буфер
+/// переиспользуется [`Scratch`] между вызовами.
+#[derive(Default)]
+pub struct Bitset {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl Bitset {
+    /// Готовит маску на `len` пикселей, все биты сброшены.
+    fn reset(&mut self, len: usize) {
+        let words = len.div_ceil(64);
+        if self.words.len() < words {
+            self.words.resize(words, 0);
+        }
+        self.words[..words].fill(0);
+        self.len = len;
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> bool {
+        debug_assert!(i < self.len, "битсет: {i} при длине {}", self.len);
+        (self.words[i >> 6] >> (i & 63)) & 1 != 0
+    }
+
+    #[inline]
+    fn set(&mut self, i: usize) {
+        debug_assert!(i < self.len, "битсет: {i} при длине {}", self.len);
+        self.words[i >> 6] |= 1 << (i & 63);
+    }
+}
+
+/// Переиспользуемые буферы очистки.
+///
+/// Один экземпляр на процесс (GUI-воркер держит его между генерациями): на 24 Мп
+/// это десятки мегабайт, которые иначе выделялись бы заново на каждый клик.
+/// Все проходы обязаны затирать буферы при входе — состояние между вызовами не
+/// переносится (тест `scratch_reuse_is_transparent`).
+#[derive(Default)]
+pub struct Scratch {
+    /// Маска «фон убран» (заливка + просветы + кайма).
+    gone: Bitset,
+    /// Маска «пиксель уже просмотрен» в обходе просветов.
+    seen: Bitset,
+    /// Маска «цвет близок к фону» для тонких щелей.
+    near: Bitset,
+    /// Маска «у пикселя есть цвет глубокого слоя» для матирования.
+    has_f: Bitset,
+    /// Расстояние до прозрачности в пикселях (`u16::MAX` — недостижимо).
+    dist: Vec<u16>,
+    /// Глубина внутри области (тонкие щели) или номер слоя (матирование).
+    depth: Vec<u16>,
+    /// Стек/очередь обхода.
+    todo: Vec<u32>,
+    /// Список пикселей одной связной области или одного слоя.
+    cells: Vec<u32>,
+    /// Смещения слоёв в [`Scratch::levels`]: слой `l` — `levels[start[l]..start[l + 1]]`.
+    level_start: Vec<u32>,
+    /// Курсор заполнения [`Scratch::levels`] (по слоям).
+    level_cursor: Vec<u32>,
+    /// Пиксели по слоям полосы матирования, плоским списком.
+    levels: Vec<u32>,
+    /// Цвет «глубокого» слоя для матирования (3 байта на пиксель).
+    fcol: Vec<[u8; 3]>,
+}
+
+/// Расстояние (4-связность) от каждого пикселя до ближайшего прозрачного.
+///
+/// BFS от прозрачных пикселей с ограничением `cap`: заливка не уходит дальше
+/// `cap + 1` шагов, поэтому на 24 Мп обходится только полоса у границы объекта,
+/// а не всё изображение. `todo` — переиспользуемая очередь (`u32` вместо
+/// `usize`), `dist` заполняется `u16::MAX` для недостижимых.
+fn distance_to_transparent(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    cap: u16,
+    dist: &mut Vec<u16>,
+    todo: &mut Vec<u32>,
+) {
+    dist.clear();
+    dist.resize(w * h, u16::MAX);
+    todo.clear();
+    for p in 0..w * h {
+        if rgba[p * 4 + 3] == 0 {
+            dist[p] = 0;
+            todo.push(p as u32);
+        }
+    }
+    let mut head = 0;
+    while head < todo.len() {
+        let p = todo[head] as usize;
+        head += 1;
+        let next = dist[p] + 1;
+        if next > cap {
+            continue;
+        }
+        let (x, y) = (p % w, p / w);
+        let visit = |q: usize, dist: &mut Vec<u16>, todo: &mut Vec<u32>| {
+            if dist[q] == u16::MAX {
+                dist[q] = next;
+                todo.push(q as u32);
+            }
+        };
+        if x > 0 {
+            visit(p - 1, dist, todo);
+        }
+        if x + 1 < w {
+            visit(p + 1, dist, todo);
+        }
+        if y > 0 {
+            visit(p - w, dist, todo);
+        }
+        if y + 1 < h {
+            visit(p + w, dist, todo);
+        }
+    }
+}
+
 /// Удаляет однотонный фон: заливка от границ изображения по пикселям, близким к
 /// цвету фона (4-связность). Цвета внутри персонажа, не связанные с краем
 /// (белые блики, кроссовки, замкнутые просветы), не затрагиваются.
@@ -71,86 +193,146 @@ pub fn remove_background(
     grow: u32,
     min_hole: usize,
 ) -> usize {
-    assert_eq!(rgba.len(), w * h * 4);
-    let mut gone = vec![false; w * h];
-    let mut stack: Vec<usize> = Vec::new();
+    let mut scratch = Scratch::default();
+    remove_background_in(rgba, w, h, bg, tol, grow, min_hole, &mut scratch)
+}
 
-    // Затравки: все граничные пиксели, подходящие под фон.
-    let seed = |x: usize, y: usize, gone: &mut Vec<bool>, stack: &mut Vec<usize>| {
-        let p = y * w + x;
-        if !gone[p] && is_bg(rgba, p * 4, bg, tol) {
-            gone[p] = true;
-            stack.push(p);
+/// То же, что [`remove_background`], с переиспользуемыми буферами.
+///
+/// Заливка scanline: стек хранит только затравки строк (порядка `O(w)`), а не
+/// каждый пиксель, поэтому на 24 Мп стек не растёт до размера изображения.
+pub fn remove_background_in(
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    bg: [u8; 3],
+    tol: u8,
+    grow: u32,
+    min_hole: usize,
+    scratch: &mut Scratch,
+) -> usize {
+    assert_eq!(rgba.len(), w * h * 4);
+    let n = w * h;
+    let Scratch {
+        gone,
+        seen,
+        todo,
+        cells,
+        ..
+    } = scratch;
+    gone.reset(n);
+    todo.clear();
+
+    // Затравки: все граничные пиксели, подходящие под фон. Помечаем их не здесь,
+    // а при заливке прогона — иначе повторно затравленный пиксель стоил бы
+    // повторного прохода по строке.
+    let push_seed = |p: usize, gone: &Bitset, todo: &mut Vec<u32>| {
+        if !gone.get(p) && is_bg(rgba, p * 4, bg, tol) {
+            todo.push(p as u32);
         }
     };
     for x in 0..w {
-        seed(x, 0, &mut gone, &mut stack);
-        seed(x, h - 1, &mut gone, &mut stack);
+        push_seed(x, gone, todo);
+        push_seed((h - 1) * w + x, gone, todo);
     }
     for y in 0..h {
-        seed(0, y, &mut gone, &mut stack);
-        seed(w - 1, y, &mut gone, &mut stack);
+        push_seed(y * w, gone, todo);
+        push_seed(y * w + w - 1, gone, todo);
     }
 
-    // Заливка
-    while let Some(p) = stack.pop() {
-        let (x, y) = (p % w, p / w);
-        let mut visit = |q: usize| {
-            if !gone[q] && is_bg(rgba, q * 4, bg, tol) {
-                gone[q] = true;
-                stack.push(q);
+    // Заливка прогонами: каждый вход в цикл либо красит хотя бы один новый
+    // пиксель, либо сразу выходит, поэтому всего работы `O(n)`.
+    while let Some(start) = todo.pop() {
+        let p = start as usize;
+        if gone.get(p) {
+            continue; // прогон уже закрашен другой затравкой
+        }
+        if !is_bg(rgba, p * 4, bg, tol) {
+            continue; // страховка от затравки, переставшей быть фоном
+        }
+        let y = p / w;
+        let mut xl = p % w;
+        let mut xr = xl;
+        while xl > 0 {
+            let q = y * w + xl - 1;
+            if gone.get(q) || !is_bg(rgba, q * 4, bg, tol) {
+                break;
             }
-        };
-        if x > 0 {
-            visit(p - 1);
+            xl -= 1;
         }
-        if x + 1 < w {
-            visit(p + 1);
+        while xr + 1 < w {
+            let q = y * w + xr + 1;
+            if gone.get(q) || !is_bg(rgba, q * 4, bg, tol) {
+                break;
+            }
+            xr += 1;
         }
-        if y > 0 {
-            visit(p - w);
+        for x in xl..=xr {
+            gone.set(y * w + x);
         }
-        if y + 1 < h {
-            visit(p + w);
+        // Соседние строки: затравляем по одному пикселю на прогон, а не на
+        // каждый пиксель — иначе стек раздувается до размера изображения.
+        for row in [y.checked_sub(1), Some(y + 1)].into_iter().flatten() {
+            if row >= h {
+                continue;
+            }
+            let mut x = xl;
+            while x <= xr {
+                let q = row * w + x;
+                if gone.get(q) || !is_bg(rgba, q * 4, bg, tol) {
+                    x += 1;
+                    continue;
+                }
+                todo.push(q as u32);
+                // Пропускаем весь ещё не закрашенный прогон этого ряда.
+                while x <= xr {
+                    let q = row * w + x;
+                    if gone.get(q) || !is_bg(rgba, q * 4, bg, tol) {
+                        break;
+                    }
+                    x += 1;
+                }
+            }
         }
     }
 
     // Замкнутые просветы фона: крупные связные области цвета фона внутри объекта.
     if min_hole > 0 {
-        let mut seen = vec![false; w * h];
-        for start in 0..w * h {
-            if gone[start] || seen[start] || !is_bg(rgba, start * 4, bg, tol) {
+        seen.reset(n);
+        for start in 0..n {
+            if gone.get(start) || seen.get(start) || !is_bg(rgba, start * 4, bg, tol) {
                 continue;
             }
-            let mut cells = vec![start];
-            let mut stack = vec![start];
-            seen[start] = true;
-            while let Some(p) = stack.pop() {
+            cells.clear();
+            cells.push(start as u32);
+            seen.set(start);
+            let mut head = 0;
+            while head < cells.len() {
+                let p = cells[head] as usize;
+                head += 1;
                 let (x, y) = (p % w, p / w);
-                let mut nb = [usize::MAX; 4];
+                let visit = |q: usize, seen: &mut Bitset, cells: &mut Vec<u32>| {
+                    if !gone.get(q) && !seen.get(q) && is_bg(rgba, q * 4, bg, tol) {
+                        seen.set(q);
+                        cells.push(q as u32);
+                    }
+                };
                 if x > 0 {
-                    nb[0] = p - 1;
+                    visit(p - 1, seen, cells);
                 }
                 if x + 1 < w {
-                    nb[1] = p + 1;
+                    visit(p + 1, seen, cells);
                 }
                 if y > 0 {
-                    nb[2] = p - w;
+                    visit(p - w, seen, cells);
                 }
                 if y + 1 < h {
-                    nb[3] = p + w;
-                }
-                for q in nb {
-                    if q != usize::MAX && !gone[q] && !seen[q] && is_bg(rgba, q * 4, bg, tol) {
-                        seen[q] = true;
-                        cells.push(q);
-                        stack.push(q);
-                    }
+                    visit(p + w, seen, cells);
                 }
             }
             if cells.len() >= min_hole {
-                for q in cells {
-                    gone[q] = true;
+                for &q in cells.iter() {
+                    gone.set(q as usize);
                 }
             }
         }
@@ -159,33 +341,33 @@ pub fn remove_background(
     // Снятие светлой каймы слоями вдоль найденной границы.
     let soft = tol.saturating_mul(3);
     for _ in 0..grow {
-        let mut layer: Vec<usize> = Vec::new();
+        cells.clear();
         for y in 0..h {
             for x in 0..w {
                 let p = y * w + x;
-                if gone[p] || dist(rgba, p * 4, bg) > soft {
+                if gone.get(p) || dist(rgba, p * 4, bg) > soft {
                     continue;
                 }
-                let touches = (x > 0 && gone[p - 1])
-                    || (x + 1 < w && gone[p + 1])
-                    || (y > 0 && gone[p - w])
-                    || (y + 1 < h && gone[p + w]);
+                let touches = (x > 0 && gone.get(p - 1))
+                    || (x + 1 < w && gone.get(p + 1))
+                    || (y > 0 && gone.get(p - w))
+                    || (y + 1 < h && gone.get(p + w));
                 if touches {
-                    layer.push(p);
+                    cells.push(p as u32);
                 }
             }
         }
-        if layer.is_empty() {
+        if cells.is_empty() {
             break;
         }
-        for p in layer {
-            gone[p] = true;
+        for &q in cells.iter() {
+            gone.set(q as usize);
         }
     }
 
     let mut removed = 0;
-    for (g, px) in gone.iter().zip(rgba.chunks_exact_mut(4)) {
-        if *g {
+    for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+        if gone.get(i) {
             if px[3] != 0 {
                 removed += 1;
             }
@@ -211,108 +393,161 @@ pub fn remove_thin_pockets(
     reach: u32,
     max_width: u32,
 ) -> usize {
-    use std::collections::VecDeque;
+    let mut scratch = Scratch::default();
+    remove_thin_pockets_in(rgba, w, h, bg, tol, reach, max_width, &mut scratch)
+}
+
+/// То же, что [`remove_thin_pockets`], с переиспользуемыми буферами.
+///
+/// Расстояния и глубины хранятся в `u16` (по построению не больше `reach` и
+/// `max_width`, оба малы), маски — битсетом, списки пикселей — `Vec<u32>`.
+pub fn remove_thin_pockets_in(
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    bg: [u8; 3],
+    tol: u8,
+    reach: u32,
+    max_width: u32,
+    scratch: &mut Scratch,
+) -> usize {
     assert_eq!(rgba.len(), w * h * 4);
     if reach == 0 || max_width == 0 {
         return 0;
     }
+    debug_assert!(reach <= u16::MAX as u32, "reach {reach} не влезает в u16");
+    debug_assert!(
+        max_width <= u16::MAX as u32,
+        "max_width {max_width} не влезает в u16"
+    );
     let n = w * h;
-    let near: Vec<bool> = rgba
-        .chunks_exact(4)
-        .map(|px| px[3] != 0 && dist_px(px, bg) <= tol)
-        .collect();
-    let neighbors = |p: usize| {
-        let (x, y) = (p % w, p / w);
-        [
-            if x > 0 { p - 1 } else { usize::MAX },
-            if x + 1 < w { p + 1 } else { usize::MAX },
-            if y > 0 { p - w } else { usize::MAX },
-            if y + 1 < h { p + w } else { usize::MAX },
-        ]
-    };
+    let reach16 = reach as u16;
+    let width16 = max_width as u16;
+    let Scratch {
+        near,
+        seen,
+        dist,
+        depth,
+        todo,
+        cells,
+        ..
+    } = scratch;
+
+    near.reset(n);
+    for (i, px) in rgba.chunks_exact(4).enumerate() {
+        if px[3] != 0 && dist_px(px, bg) <= tol {
+            near.set(i);
+        }
+    }
 
     // Расстояние до прозрачности, считаем до `reach`.
-    let mut d = vec![u32::MAX; n];
-    let mut q: VecDeque<usize> = VecDeque::new();
-    for p in 0..n {
-        if rgba[p * 4 + 3] == 0 {
-            d[p] = 0;
-            q.push_back(p);
-        }
-    }
-    if q.is_empty() {
+    distance_to_transparent(rgba, w, h, reach16, dist, todo);
+    if !dist.iter().any(|&d| d == 0) {
         return 0;
     }
-    while let Some(p) = q.pop_front() {
-        if d[p] >= reach {
-            continue;
-        }
-        for t in neighbors(p) {
-            if t != usize::MAX && d[t] == u32::MAX {
-                d[t] = d[p] + 1;
-                q.push_back(t);
-            }
-        }
-    }
 
-    let mut seen = vec![false; n];
-    let mut inner = vec![0u32; n]; // глубина пикселя внутри своей области
+    seen.reset(n);
+    depth.clear();
+    depth.resize(n, 0);
     let mut removed = 0;
+
     for start in 0..n {
-        if !near[start] || seen[start] {
+        if !near.get(start) || seen.get(start) {
             continue;
         }
         // Связная область (4-связность).
-        let mut cells = vec![start];
-        seen[start] = true;
-        let mut i = 0;
-        while i < cells.len() {
-            let p = cells[i];
-            i += 1;
-            for t in neighbors(p) {
-                if t != usize::MAX && near[t] && !seen[t] {
-                    seen[t] = true;
-                    cells.push(t);
+        cells.clear();
+        cells.push(start as u32);
+        seen.set(start);
+        let mut head = 0;
+        while head < cells.len() {
+            let p = cells[head] as usize;
+            head += 1;
+            let (x, y) = (p % w, p / w);
+            let visit = |q: usize, seen: &mut Bitset, cells: &mut Vec<u32>| {
+                if near.get(q) && !seen.get(q) {
+                    seen.set(q);
+                    cells.push(q as u32);
                 }
+            };
+            if x > 0 {
+                visit(p - 1, seen, cells);
+            }
+            if x + 1 < w {
+                visit(p + 1, seen, cells);
+            }
+            if y > 0 {
+                visit(p - w, seen, cells);
+            }
+            if y + 1 < h {
+                visit(p + w, seen, cells);
             }
         }
+
         // Подходит ли область к границе достаточно близко?
-        if !cells.iter().any(|&p| d[p] != u32::MAX && d[p] <= reach) {
+        let close = cells
+            .iter()
+            .any(|&p| dist[p as usize] != u16::MAX && dist[p as usize] <= reach16);
+        if !close {
             continue;
         }
+
         // Глубина внутри области: от пикселей, у которых есть сосед вне области.
-        let mut bq: VecDeque<usize> = VecDeque::new();
-        for &p in &cells {
-            let edge = neighbors(p).iter().any(|&t| t != usize::MAX && !near[t]);
+        todo.clear();
+        for &p in cells.iter() {
+            let p = p as usize;
+            let (x, y) = (p % w, p / w);
+            let edge = (x > 0 && !near.get(p - 1))
+                || (x + 1 < w && !near.get(p + 1))
+                || (y > 0 && !near.get(p - w))
+                || (y + 1 < h && !near.get(p + w));
             if edge {
-                inner[p] = 1;
-                bq.push_back(p);
+                depth[p] = 1;
+                todo.push(p as u32);
             }
         }
-        let mut max_depth = 0;
-        if bq.is_empty() {
-            max_depth = u32::MAX; // область без границы (вся картинка): не трогаем
+        let mut max_depth = 0u16;
+        if todo.is_empty() {
+            max_depth = u16::MAX; // область без границы (вся картинка): не трогаем
         }
-        while let Some(p) = bq.pop_front() {
-            max_depth = max_depth.max(inner[p]);
-            if max_depth > max_width {
+        let mut head = 0;
+        while head < todo.len() {
+            let p = todo[head] as usize;
+            head += 1;
+            max_depth = max_depth.max(depth[p]);
+            if max_depth > width16 {
                 break;
             }
-            for t in neighbors(p) {
-                if t != usize::MAX && near[t] && inner[t] == 0 {
-                    inner[t] = inner[p] + 1;
-                    bq.push_back(t);
+            let (x, y) = (p % w, p / w);
+            let next = depth[p] + 1;
+            let visit = |q: usize, depth: &mut Vec<u16>, todo: &mut Vec<u32>| {
+                if near.get(q) && depth[q] == 0 {
+                    depth[q] = next;
+                    todo.push(q as u32);
                 }
+            };
+            if x > 0 {
+                visit(p - 1, depth, todo);
+            }
+            if x + 1 < w {
+                visit(p + 1, depth, todo);
+            }
+            if y > 0 {
+                visit(p - w, depth, todo);
+            }
+            if y + 1 < h {
+                visit(p + w, depth, todo);
             }
         }
         // Если выход по break, глубина больше max_width: область толстая.
-        let thin = max_depth <= max_width;
-        for &p in &cells {
-            inner[p] = 0;
+        let thin = max_depth <= width16;
+        for &p in cells.iter() {
+            depth[p as usize] = 0;
         }
         if thin {
-            for &p in &cells {
-                rgba[p * 4..p * 4 + 4].copy_from_slice(&[0, 0, 0, 0]);
+            for &p in cells.iter() {
+                let i = p as usize * 4;
+                rgba[i..i + 4].copy_from_slice(&[0, 0, 0, 0]);
             }
             removed += cells.len();
         }
@@ -344,89 +579,125 @@ pub fn auto_defringe_depth(w: usize, h: usize) -> u32 {
 /// близок к фону (`MIN_CONTRAST`), остаются как есть. Возвращает число изменённых
 /// пикселей. Вызывать после `remove_background`.
 pub fn defringe(rgba: &mut [u8], w: usize, h: usize, bg: [u8; 3], depth: u32) -> usize {
-    use std::collections::VecDeque;
+    let mut scratch = Scratch::default();
+    defringe_in(rgba, w, h, bg, depth, &mut scratch)
+}
+
+/// То же, что [`defringe`], с переиспользуемыми буферами.
+///
+/// Расстояния — `u16` (по построению не больше `depth + 1`), слои — плоский
+/// список `u32` со смещениями, цвет глубокого слоя — 3 байта на пиксель,
+/// признак «цвет есть» — битсет. Флаг `has_f` сбрасывается на входе, поэтому
+/// значения `fcol` от прошлого вызова наружу не просачиваются.
+pub fn defringe_in(
+    rgba: &mut [u8],
+    w: usize,
+    h: usize,
+    bg: [u8; 3],
+    depth: u32,
+    scratch: &mut Scratch,
+) -> usize {
     assert_eq!(rgba.len(), w * h * 4);
     if depth == 0 {
         return 0;
     }
+    debug_assert!(depth <= u16::MAX as u32 - 2, "depth {depth} не влезает в u16");
     let n = w * h;
+    let depth_us = depth as usize;
+    let depth16 = depth as u16;
+    let Scratch {
+        dist,
+        has_f,
+        todo,
+        level_start,
+        level_cursor,
+        levels,
+        fcol,
+        ..
+    } = scratch;
 
     // 1. Расстояние (4-связность) от прозрачных пикселей; считаем до depth+1.
-    let mut d = vec![u32::MAX; n];
-    let mut queue: VecDeque<usize> = VecDeque::new();
-    for p in 0..n {
-        if rgba[p * 4 + 3] == 0 {
-            d[p] = 0;
-            queue.push_back(p);
-        }
-    }
-    if queue.is_empty() {
+    distance_to_transparent(rgba, w, h, depth16 + 1, dist, todo);
+    if !dist.iter().any(|&d| d == 0) {
         return 0;
     }
-    let neighbors = |p: usize| {
-        let (x, y) = (p % w, p / w);
-        [
-            if x > 0 { p - 1 } else { usize::MAX },
-            if x + 1 < w { p + 1 } else { usize::MAX },
-            if y > 0 { p - w } else { usize::MAX },
-            if y + 1 < h { p + w } else { usize::MAX },
-        ]
-    };
-    while let Some(p) = queue.pop_front() {
-        let nd = d[p] + 1;
-        if nd > depth + 1 {
-            continue;
+
+    // Пиксели полосы по слоям: `levels[start[l]..start[l + 1]]` — слой `l`.
+    level_start.clear();
+    level_start.resize(depth_us + 2, 0);
+    for &dd in dist.iter().take(n) {
+        if dd >= 1 && dd as usize <= depth_us {
+            level_start[dd as usize + 1] += 1;
         }
-        for q in neighbors(p) {
-            if q != usize::MAX && d[q] == u32::MAX {
-                d[q] = nd;
-                queue.push_back(q);
-            }
+    }
+    for l in 1..=depth_us + 1 {
+        level_start[l] += level_start[l - 1];
+    }
+    levels.clear();
+    levels.resize(level_start[depth_us + 1] as usize, 0);
+    level_cursor.clear();
+    level_cursor.extend_from_slice(&level_start[..=depth_us]);
+    for p in 0..n {
+        let dd = dist[p];
+        if dd >= 1 && dd as usize <= depth_us {
+            let l = dd as usize;
+            let idx = level_cursor[l] as usize;
+            levels[idx] = p as u32;
+            level_cursor[l] += 1;
         }
     }
 
-    // Пиксели полосы по слоям: levels[l] — расстояние l (1..=depth).
-    let mut levels: Vec<Vec<usize>> = vec![Vec::new(); depth as usize + 1];
-    for p in 0..n {
-        if d[p] >= 1 && d[p] <= depth {
-            levels[d[p] as usize].push(p);
-        }
+    has_f.reset(n);
+    if fcol.len() < n {
+        fcol.resize(n, [0u8; 3]);
     }
+    let mut changed = 0;
 
     // 2-3. Идём от глубоких слоёв к границе: оценка F, затем доля объекта.
-    let mut fcol = vec![[0u8; 3]; n];
-    let mut has_f = vec![false; n];
-    let mut changed = 0;
-    for lv in (1..=depth as usize).rev() {
-        for &p in &levels[lv] {
+    for lv in (1..=depth_us).rev() {
+        let from = level_start[lv] as usize;
+        let to = level_start[lv + 1] as usize;
+        for &p in &levels[from..to] {
+            let p = p as usize;
+            let (x, y) = (p % w, p / w);
             let mut sum = [0f32; 3];
             let mut cnt = 0f32;
-            for q in neighbors(p) {
-                if q == usize::MAX {
-                    continue;
-                }
-                let deeper = d[q] as usize == lv + 1 || (lv == depth as usize && d[q] > depth);
+            let gather = |q: usize, sum: &mut [f32; 3], cnt: &mut f32| {
+                let dq = dist[q] as usize;
+                let deeper = dq == lv + 1 || (lv == depth_us && dq > depth_us);
                 if !deeper {
-                    continue;
+                    return;
                 }
-                let f = if d[q] > depth {
+                let f = if dq > depth_us {
                     [rgba[q * 4], rgba[q * 4 + 1], rgba[q * 4 + 2]] // глубже полосы: свой цвет
-                } else if has_f[q] {
+                } else if has_f.get(q) {
                     fcol[q]
                 } else {
-                    continue;
+                    return;
                 };
                 for c in 0..3 {
                     sum[c] += f[c] as f32;
                 }
-                cnt += 1.0;
+                *cnt += 1.0;
+            };
+            if x > 0 {
+                gather(p - 1, &mut sum, &mut cnt);
+            }
+            if x + 1 < w {
+                gather(p + 1, &mut sum, &mut cnt);
+            }
+            if y > 0 {
+                gather(p - w, &mut sum, &mut cnt);
+            }
+            if y + 1 < h {
+                gather(p + w, &mut sum, &mut cnt);
             }
             if cnt == 0.0 {
                 continue; // нет глубокого соседа: оставляем пиксель как есть
             }
             let f = [sum[0] / cnt, sum[1] / cnt, sum[2] / cnt];
             fcol[p] = [f[0].round() as u8, f[1].round() as u8, f[2].round() as u8];
-            has_f[p] = true;
+            has_f.set(p);
 
             let v = [
                 f[0] - bg[0] as f32,
@@ -916,5 +1187,217 @@ mod tests {
             remove_thin_pockets(&mut img, w, h, [255, 255, 255], 10, 3, 0),
             0
         );
+    }
+
+    /// Битсет обязан совпадать с `Vec<bool>` на любых длинах, включая границы
+    /// слов, и повторный `reset` — полностью затирать.
+    #[test]
+    fn bitset_matches_bools() {
+        let mut bits = Bitset::default();
+        for len in [0usize, 1, 63, 64, 65, 127, 128, 129, 1000] {
+            bits.reset(len);
+            let mut want = vec![false; len];
+            let mut state = 0x1234_5678u32 ^ len as u32;
+            for i in 0..len {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                if state & 1 != 0 {
+                    bits.set(i);
+                    want[i] = true;
+                }
+            }
+            for i in 0..len {
+                assert_eq!(bits.get(i), want[i], "длина {len}, бит {i}");
+            }
+            bits.reset(len);
+            for i in 0..len {
+                assert!(!bits.get(i), "reset не затёр бит {i} при длине {len}");
+            }
+        }
+    }
+
+    /// Эталонная заливка (BFS от границ, как было до scanline-версии):
+    /// множество удалённых пикселей обязано совпасть.
+    #[test]
+    fn flood_fill_matches_reference_bfs() {
+        use std::collections::VecDeque;
+
+        fn reference(rgba: &mut [u8], w: usize, h: usize, bg: [u8; 3], tol: u8) -> usize {
+            let is_bg = |i: usize, rgba: &[u8]| {
+                rgba[i * 4 + 3] == 0 || dist_px(&rgba[i * 4..i * 4 + 3], bg) <= tol
+            };
+            let n = w * h;
+            let mut gone = vec![false; n];
+            let mut queue = VecDeque::new();
+            let seed = |p: usize, gone: &mut Vec<bool>, queue: &mut VecDeque<usize>| {
+                if !gone[p] && is_bg(p, rgba) {
+                    gone[p] = true;
+                    queue.push_back(p);
+                }
+            };
+            for x in 0..w {
+                seed(x, &mut gone, &mut queue);
+                seed((h - 1) * w + x, &mut gone, &mut queue);
+            }
+            for y in 0..h {
+                seed(y * w, &mut gone, &mut queue);
+                seed(y * w + w - 1, &mut gone, &mut queue);
+            }
+            while let Some(p) = queue.pop_front() {
+                let (x, y) = (p % w, p / w);
+                let visit = |q: usize, gone: &mut Vec<bool>, queue: &mut VecDeque<usize>| {
+                    if !gone[q] && is_bg(q, rgba) {
+                        gone[q] = true;
+                        queue.push_back(q);
+                    }
+                };
+                if x > 0 {
+                    visit(p - 1, &mut gone, &mut queue);
+                }
+                if x + 1 < w {
+                    visit(p + 1, &mut gone, &mut queue);
+                }
+                if y > 0 {
+                    visit(p - w, &mut gone, &mut queue);
+                }
+                if y + 1 < h {
+                    visit(p + w, &mut gone, &mut queue);
+                }
+            }
+            let mut removed = 0;
+            for (p, px) in rgba.chunks_exact_mut(4).enumerate() {
+                if gone[p] {
+                    if px[3] != 0 {
+                        removed += 1;
+                    }
+                    px.copy_from_slice(&[0, 0, 0, 0]);
+                }
+            }
+            removed
+        }
+
+        let (w, h) = (32, 32);
+        let bg = [240, 236, 224];
+        let mut scratch = Scratch::default();
+        let mut state = 7u32;
+        for case in 0..200 {
+            let mut img = Vec::with_capacity(w * h * 4);
+            for _ in 0..w * h {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let bgish = state % 5 != 0;
+                let (r, g, b) = if bgish {
+                    (
+                        238 + (state >> 3) % 5,
+                        234 + (state >> 7) % 5,
+                        222 + (state >> 11) % 5,
+                    )
+                } else {
+                    (
+                        30 + (state >> 3) % 60,
+                        60 + (state >> 7) % 40,
+                        90 + (state >> 11) % 40,
+                    )
+                };
+                let a = if state % 23 == 0 { 0 } else { 255 };
+                img.extend_from_slice(&[r as u8, g as u8, b as u8, a]);
+            }
+
+            let mut want = img.clone();
+            let want_count = reference(&mut want, w, h, bg, 10);
+            let got_count = remove_background_in(&mut img, w, h, bg, 10, 0, 0, &mut scratch);
+            assert_eq!(img, want, "случай {case}: разошлись пиксели заливки");
+            assert_eq!(got_count, want_count, "случай {case}: разошёлся счётчик");
+        }
+    }
+
+    /// Переиспользование `Scratch` не должно переносить состояние между
+    /// вызовами, а `_in`-варианты обязаны давать то же, что одноразовые обёртки.
+    #[test]
+    fn scratch_reuse_is_transparent() {
+        let (w, h) = (40, 30);
+        let bg = [250, 250, 250];
+        let mut src = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let inside = x > 8 && x < 32 && y > 5 && y < 25;
+                let soft = x > 6 && x <= 8 && y > 4 && y < 26;
+                let (r, g, b, a) = if inside {
+                    (40, 70, 120, 255)
+                } else if soft {
+                    (200, 180, 160, 150)
+                } else {
+                    (250, 250, 250, 255)
+                };
+                src.extend_from_slice(&[r, g, b, a]);
+            }
+        }
+
+        let mut scratch = Scratch::default();
+        let mut runs = Vec::new();
+        for _ in 0..3 {
+            let mut img = src.clone();
+            let a = remove_background_in(&mut img, w, h, bg, 12, 1, 20, &mut scratch);
+            let b = remove_thin_pockets_in(&mut img, w, h, bg, 12, 4, 2, &mut scratch);
+            let c = defringe_in(&mut img, w, h, bg, 3, &mut scratch);
+            runs.push((img, a, b, c));
+        }
+        assert_eq!(runs[0].0, runs[1].0, "второй прогон с тем же Scratch");
+        assert_eq!(runs[0].0, runs[2].0, "третий прогон с тем же Scratch");
+        assert_eq!(
+            (runs[0].1, runs[0].2, runs[0].3),
+            (runs[1].1, runs[1].2, runs[1].3)
+        );
+
+        // Одноразовые обёртки обязаны дать тот же результат.
+        let mut img = src.clone();
+        let a = remove_background(&mut img, w, h, bg, 12, 1, 20);
+        let b = remove_thin_pockets(&mut img, w, h, bg, 12, 4, 2);
+        let c = defringe(&mut img, w, h, bg, 3);
+        assert_eq!(img, runs[0].0, "обёртка и `_in` расходятся");
+        assert_eq!((a, b, c), (runs[0].1, runs[0].2, runs[0].3));
+    }
+
+    /// Крайние значения `reach`/`depth` (0, 1, 254, 255) не должны переполнять
+    /// `u16` и не должны ронять последовательность.
+    #[test]
+    fn distances_u16_edges() {
+        let (w, h) = (1, 300);
+        let mut img = vec![0u8; w * h * 4];
+        for y in 0..h {
+            let c: [u8; 4] = if y % 3 == 0 {
+                [0, 0, 0, 0]
+            } else {
+                [250, 250, 250, 255]
+            };
+            img[y * 4..y * 4 + 4].copy_from_slice(&c);
+        }
+
+        let mut scratch = Scratch::default();
+        for reach in [0u32, 1, 254, 255] {
+            for max_width in [0u32, 1, 254, 255] {
+                let mut copy = img.clone();
+                let removed = remove_thin_pockets_in(
+                    &mut copy,
+                    w,
+                    h,
+                    [250, 250, 250],
+                    10,
+                    reach,
+                    max_width,
+                    &mut scratch,
+                );
+                assert!(removed <= w * h, "reach {reach}, max_width {max_width}");
+                assert_eq!(copy.len(), w * h * 4);
+            }
+        }
+
+        for depth in [0u32, 1, 2, 254, 255] {
+            let mut copy = img.clone();
+            let changed = defringe_in(&mut copy, w, h, [250, 250, 250], depth, &mut scratch);
+            assert!(changed <= w * h, "depth {depth}");
+        }
     }
 }

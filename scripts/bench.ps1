@@ -70,10 +70,14 @@ foreach ($fixture in @($big, $mid, $alpha, $small)) {
 # JPEG-входе, поэтому пороги 24/12 Мп пересняты. Учтите: при коротких прогонах
 # (30-60 мс) опрос раз в 5 мс не всегда видит пик памяти и число занижается —
 # поэтому пороги памяти для мелких сценариев оставлены как были.
+# Этап 5 (Scratch в clean.rs) поменял природу пика вырезания: раньше буферы
+# брались через alloc_zeroed («commit есть, страниц нет»), теперь они
+# переиспользуются и честно заполняются. WS и commit сошлись на ~274 МБ, поэтому
+# порог вырезания один по обеим колонкам (было 231 WS / 330 commit).
 $Thresholds = [ordered]@{
     'pixel-art 24mp'     = @{ WsMb = 172;   CommitMb = 170;   Ms = 160 }
     'pixel-art 24mp box' = @{ WsMb = 172;   CommitMb = 170;   Ms = 115 }
-    'cutout 24mp all'    = @{ WsMb = 231.1; CommitMb = 329.9; Ms = 410 }
+    'cutout 24mp all'    = @{ WsMb = 280;   CommitMb = 280;   Ms = 410 }
     'cutout alpha png'   = @{ WsMb = 53.0;  CommitMb = 52.9;  Ms = 70 }
     'pixel-art 12mp'     = @{ WsMb = 92;    CommitMb = 90;    Ms = 95 }
     'pixel-art small'    = @{ WsMb = 47.3;  CommitMb = 43.7;  Ms = 45 }

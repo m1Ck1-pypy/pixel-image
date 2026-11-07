@@ -23,11 +23,14 @@ pub mod parallel;
 pub mod pipeline;
 pub mod resize;
 
+pub use clean::Scratch;
 pub use color::Color;
 pub use downscale::Filter;
 pub use error::{Error, Result};
 pub use pipeline::{
     BackgroundOptions, BackgroundStats, CleanStats, Conversion, Cutout, FAINT_ALPHA, Options,
-    SavedConversion, SavedCutout, StageTimes, Stats, clean_source, convert_file, convert_image,
-    convert_image_timed, cutout_file, cutout_image, output_path, render_grid, save_png,
+    SavedConversion, SavedCutout, StageTimes, Stats, clean_source, clean_source_with_scratch,
+    convert_file, convert_image, convert_image_timed, convert_image_timed_scratch,
+    convert_image_with_scratch, cutout_file, cutout_image, cutout_image_with_scratch, output_path,
+    render_grid, save_png,
 };

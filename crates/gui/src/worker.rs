@@ -153,6 +153,9 @@ impl Worker {
             // Пул потоков поднимаем в воркере: генерации сериализованы каналом,
             // поэтому первый тяжёлый кадр не должен платить за запуск потоков.
             pixel_image_core::parallel::init();
+            // Один набор буферов очистки на процесс: 24 Мп не перевыделяет
+            // десятки мегабайт на каждый клик.
+            let mut scratch = pixel_image_core::Scratch::default();
             while let Ok(job) = job_rx.recv() {
                 let result = match job {
                     Job::Shutdown => break,
@@ -170,13 +173,13 @@ impl Worker {
                         file,
                         source,
                         options,
-                    } => generate(job, file, &source, &options),
+                    } => generate(job, file, &source, &options, &mut scratch),
                     Job::Cutout {
                         job,
                         file,
                         source,
                         background,
-                    } => cutout(job, file, &source, &background),
+                    } => cutout(job, file, &source, &background, &mut scratch),
                     Job::Save {
                         job,
                         file,
@@ -313,10 +316,16 @@ fn load(path: &Path, generation: u64) -> WorkerResult {
     }
 }
 
-fn generate(job: u64, file: u64, source: &Arc<RgbaImage>, options: &Options) -> WorkerResult {
+fn generate(
+    job: u64,
+    file: u64,
+    source: &Arc<RgbaImage>,
+    options: &Options,
+    scratch: &mut pixel_image_core::Scratch,
+) -> WorkerResult {
     let started = Instant::now();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pixel_image_core::convert_image(source.as_ref(), options)
+        pixel_image_core::convert_image_with_scratch(source.as_ref(), options, scratch)
     }))
     .unwrap_or_else(|_| Err(Error::msg("ВНУТРЕННЯЯ ОШИБКА ГЕНЕРАЦИИ")));
     let elapsed = started.elapsed();
@@ -341,10 +350,11 @@ fn cutout(
     file: u64,
     source: &Arc<RgbaImage>,
     background: &BackgroundOptions,
+    scratch: &mut pixel_image_core::Scratch,
 ) -> WorkerResult {
     let started = Instant::now();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pixel_image_core::cutout_image((**source).clone(), background)
+        pixel_image_core::cutout_image_with_scratch((**source).clone(), background, scratch)
     }))
     .unwrap_or_else(|_| Err(Error::msg("ВНУТРЕННЯЯ ОШИБКА ВЫРЕЗКИ")));
     let elapsed = started.elapsed();
