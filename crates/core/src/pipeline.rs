@@ -6,6 +6,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use image::{RgbImage, RgbaImage};
@@ -170,6 +171,53 @@ pub struct Stats {
     pub clean: CleanStats,
 }
 
+/// Тайминги этапов конвейера в миллисекундах.
+///
+/// Ядро остаётся молчаливым: время собирается здесь, печатает его вызывающая
+/// сторона (флаг `--verbose` в CLI). Не входит в [`Stats`], потому что это
+/// диагностика, а не результат преобразования.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StageTimes {
+    /// Чтение файла и декодирование в RGBA (только в `*_file`-функциях).
+    pub open: f32,
+    /// Очистка исходника: слабая альфа, вырезание фона, матирование.
+    pub clean: f32,
+    /// Уменьшение до сетки.
+    pub downscale: f32,
+    /// Порог альфы, despeckle и подсчёт прозрачных ячеек.
+    pub threshold: f32,
+    /// Гистограмма уникальных цветов.
+    pub histogram: f32,
+    /// Построение палитры (median cut).
+    pub palette: f32,
+    /// Таблица ближайших цветов и ремап сетки.
+    pub remap: f32,
+    /// Увеличение и наложение сетки.
+    pub upscale: f32,
+    /// Запись PNG на диск (только в `*_file`-функциях).
+    pub save: f32,
+}
+
+impl StageTimes {
+    /// Сумма этапов, мс.
+    pub fn total(&self) -> f32 {
+        self.open
+            + self.clean
+            + self.downscale
+            + self.threshold
+            + self.histogram
+            + self.palette
+            + self.remap
+            + self.upscale
+            + self.save
+    }
+}
+
+/// Миллисекунды с момента `started`.
+fn since(started: Instant) -> f32 {
+    started.elapsed().as_secs_f32() * 1000.0
+}
+
 /// Результат преобразования в памяти.
 #[derive(Debug)]
 pub struct Conversion {
@@ -190,6 +238,8 @@ pub struct SavedConversion {
     pub sprite_path: PathBuf,
     /// Счётчики этапов.
     pub stats: Stats,
+    /// Время по этапам, включая чтение файла и запись PNG.
+    pub times: StageTimes,
 }
 
 /// Результат вырезания фона в памяти.
@@ -216,6 +266,8 @@ pub struct SavedCutout {
     pub stats: CleanStats,
     /// Правда ли, что результат полностью прозрачный.
     pub fully_transparent: bool,
+    /// Время по этапам: чтение файла, очистка, запись PNG.
+    pub times: StageTimes,
 }
 
 /// Очистка исходника: слабая альфа, вырезание фона, тонкие щели, матирование.
@@ -277,9 +329,23 @@ pub fn clean_source(src: &mut RgbaImage, background: Option<&BackgroundOptions>)
 }
 
 /// Превращает RGBA-изображение в пиксель-арт, не трогая диск.
-pub fn convert_image(mut src: RgbaImage, options: &Options) -> Result<Conversion> {
+pub fn convert_image(src: RgbaImage, options: &Options) -> Result<Conversion> {
+    convert_image_timed(src, options).map(|(conversion, _)| conversion)
+}
+
+/// То же, что [`convert_image`], но возвращает и время по этапам.
+///
+/// Нужно для `--verbose` в CLI: ядро само ничего не печатает.
+pub fn convert_image_timed(
+    mut src: RgbaImage,
+    options: &Options,
+) -> Result<(Conversion, StageTimes)> {
     options.validate()?;
+    let mut times = StageTimes::default();
+
+    let started = Instant::now();
     let clean_stats = clean_source(&mut src, options.background_removal.as_ref());
+    times.clean = since(started);
 
     let (w, h) = src.dimensions();
     if w == 0 || h == 0 {
@@ -288,9 +354,13 @@ pub fn convert_image(mut src: RgbaImage, options: &Options) -> Result<Conversion
 
     let grid_w = options.width;
     let grid_h = ((h as f64 * grid_w as f64 / w as f64).round() as u32).max(1);
+
+    let started = Instant::now();
     let mut sprite = options.filter.downscale(&src, grid_w, grid_h);
+    times.downscale = since(started);
     drop(src); // исходник больше не нужен
 
+    let started = Instant::now();
     apply_alpha_threshold(&mut sprite, options.alpha_threshold);
     let despeckled = clean::despeckle(
         sprite.as_mut(),
@@ -305,13 +375,21 @@ pub fn convert_image(mut src: RgbaImage, options: &Options) -> Result<Conversion
         .iter()
         .filter(|p| p[3] == 0)
         .count();
+    times.threshold = since(started);
 
+    let started = Instant::now();
     let hist = histogram(&sprite);
+    times.histogram = since(started);
     if hist.is_empty() {
         return Err(Error::msg("изображение полностью прозрачное"));
     }
     let unique_colors = hist.len();
+
+    let started = Instant::now();
     let palette = Palette::median_cut(hist.clone(), options.colors as usize);
+    times.palette = since(started);
+
+    let started = Instant::now();
     let remap: HashMap<u32, Color> = hist
         .iter()
         .map(|e| (key(e.color), palette.nearest(e.color)))
@@ -323,7 +401,9 @@ pub fn convert_image(mut src: RgbaImage, options: &Options) -> Result<Conversion
             p[..3].copy_from_slice(&c);
         }
     }
+    times.remap = since(started);
 
+    let started = Instant::now();
     let alpha = (options.grid_opacity as u32 * 255 + 50) / 100;
     let big = if let Some(fill) = options.fill {
         let mut filled = sprite.clone();
@@ -336,6 +416,7 @@ pub fn convert_image(mut src: RgbaImage, options: &Options) -> Result<Conversion
     } else {
         upscale_with_grid(&sprite, options.cell, options.grid_color, alpha, true)?
     };
+    times.upscale = since(started);
 
     let output_width = big.width();
     let output_height = big.height();
@@ -352,11 +433,14 @@ pub fn convert_image(mut src: RgbaImage, options: &Options) -> Result<Conversion
         clean: clean_stats,
     };
 
-    Ok(Conversion {
-        grid: big,
-        sprite,
-        stats,
-    })
+    Ok((
+        Conversion {
+            grid: big,
+            sprite,
+            stats,
+        },
+        times,
+    ))
 }
 
 /// Читает файл, превращает его в пиксель-арт и сохраняет `_grid.png` и
@@ -366,22 +450,38 @@ pub fn convert_file(
     options: &Options,
     prefix: Option<&str>,
 ) -> Result<SavedConversion> {
+    let started = Instant::now();
     let src = image::open(input)?.into_rgba8();
-    let Conversion {
+    let mut times = StageTimes {
+        open: since(started),
+        ..StageTimes::default()
+    };
+
+    let (Conversion {
         grid,
         sprite,
         stats,
-    } = convert_image(src, options)?;
+    }, stage) = convert_image_timed(src, options)?;
+    times.clean = stage.clean;
+    times.downscale = stage.downscale;
+    times.threshold = stage.threshold;
+    times.histogram = stage.histogram;
+    times.palette = stage.palette;
+    times.remap = stage.remap;
+    times.upscale = stage.upscale;
 
+    let started = Instant::now();
     let grid_path = output_path(input, prefix, "_grid.png");
     let sprite_path = output_path(input, prefix, "_sprite.png");
     save_png(&grid, options.fill, &grid_path)?;
     save_png(&sprite, options.fill, &sprite_path)?;
+    times.save = since(started);
 
     Ok(SavedConversion {
         grid_path,
         sprite_path,
         stats,
+        times,
     })
 }
 
@@ -402,17 +502,31 @@ pub fn cutout_file(
     background: &BackgroundOptions,
     prefix: Option<&str>,
 ) -> Result<SavedCutout> {
+    let started = Instant::now();
     let src = image::open(input)?.into_rgba8();
+    let open = since(started);
+
+    let started = Instant::now();
     let cut = cutout_image(src, background)?;
+    let clean = since(started);
+
     let path = output_path(input, prefix, "_cut.png");
     let (width, height) = cut.image.dimensions();
+    let started = Instant::now();
     save_png(&cut.image, None, &path)?;
+    let save = since(started);
     Ok(SavedCutout {
         path,
         width,
         height,
         stats: cut.stats,
         fully_transparent: cut.fully_transparent,
+        times: StageTimes {
+            open,
+            clean,
+            save,
+            ..StageTimes::default()
+        },
     })
 }
 

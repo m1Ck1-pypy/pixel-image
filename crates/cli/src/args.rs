@@ -178,6 +178,10 @@ pub struct Args {
     /// сохраняются в папке входного файла, если в префиксе нет пути)
     #[arg(short, long, value_name = "NAME")]
     pub prefix: Option<String>,
+
+    /// Печатать время по этапам конвейера (диагностика; на результат не влияет)
+    #[arg(long)]
+    pub verbose: bool,
 }
 
 impl Args {

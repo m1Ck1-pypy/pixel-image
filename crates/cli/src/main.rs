@@ -4,7 +4,7 @@ use std::{process, time::Instant};
 
 use args::Args;
 use clap::{CommandFactory, FromArgMatches, parser::ValueSource};
-use pixel_image_core::{CleanStats, convert_file, cutout_file};
+use pixel_image_core::{CleanStats, StageTimes, convert_file, cutout_file};
 
 fn main() {
     let matches = Args::command().get_matches();
@@ -62,6 +62,29 @@ fn main() {
     }
 }
 
+/// Печатает время по этапам (`--verbose`). Нулевые этапы не показываются:
+/// у `--cutbg` нет уменьшения и сетки, у пиксель-арта — своей очистки фона.
+fn print_stages(times: &StageTimes) {
+    let mut parts: Vec<String> = Vec::with_capacity(9);
+    let stages = [
+        ("открытие", times.open),
+        ("очистка", times.clean),
+        ("уменьшение", times.downscale),
+        ("порог+мусор", times.threshold),
+        ("гистограмма", times.histogram),
+        ("палитра", times.palette),
+        ("ремап", times.remap),
+        ("сетка", times.upscale),
+        ("запись", times.save),
+    ];
+    for (name, ms) in stages {
+        if ms > 0.0 {
+            parts.push(format!("{name} {ms:.1} мс"));
+        }
+    }
+    println!("Этапы: {} (сумма {:.1} мс)", parts.join(", "), times.total());
+}
+
 /// Печатает статистику очистки исходника в том же порядке, в котором она
 /// собиралась.
 fn print_clean_stats(stats: &CleanStats, thin_gaps_enabled: bool) {
@@ -108,6 +131,9 @@ fn run_cutbg(args: &Args) -> pixel_image_core::Result<()> {
         saved.height,
         saved.path.display()
     );
+    if args.verbose {
+        print_stages(&saved.times);
+    }
     println!("Время: {:.2?}", t0.elapsed());
     Ok(())
 }
@@ -150,6 +176,9 @@ fn run(args: &Args) -> pixel_image_core::Result<()> {
         stats.grid_height,
         saved.sprite_path.display()
     );
+    if args.verbose {
+        print_stages(&saved.times);
+    }
     println!("Время: {:.2?}", t0.elapsed());
     Ok(())
 }
