@@ -83,6 +83,8 @@ pub enum FocusId {
     /// Undo/redo chips in the sidebar header.
     Undo,
     Redo,
+    /// "СБРОСИТЬ НАСТРОЙКИ" chip right after the sidebar caption.
+    ResetSettings,
     Filter,
     Field(Field),
     Toggle(Toggle),
@@ -724,6 +726,19 @@ impl Model {
         self.history_base = self.snapshot();
         self.undo.clear();
         self.redo.clear();
+    }
+
+    /// Restore the editable settings to their defaults.
+    ///
+    /// Only the values the settings panel owns (and the export folder/prefix)
+    /// are reset. The open file, the active mode, the recent list and the
+    /// window state stay as they are; the caller records the change in the
+    /// undo history like any other edit.
+    pub fn reset_settings(&mut self) {
+        self.params = PixelParams::default();
+        self.output = OutputParams::default();
+        self.edit = None;
+        self.dropdown_open = false;
     }
 
     /// Record a change that has already been applied to `params`/`output`.
@@ -2178,5 +2193,41 @@ mod tests {
         model.commit_edit();
         assert_eq!(model.output.prefix, None);
         assert!(model.export_dialog_open());
+    }
+
+    #[test]
+    fn reset_settings_returns_the_editable_values_to_defaults() {
+        let mut model = model_with_file();
+        model.params.width = 96;
+        model.params.colors = 8;
+        model.params.remove_bg = true;
+        model.output.prefix = Some("art".to_string());
+        model.output.dir = Some(PathBuf::from("C:/art/out"));
+        model.begin_edit(Field::Width);
+        model.dropdown_open = true;
+
+        model.reset_settings();
+
+        assert_eq!(model.params, PixelParams::default());
+        assert_eq!(model.output, OutputParams::default());
+        assert!(model.edit.is_none());
+        assert!(!model.dropdown_open);
+        // File context and recent files are not settings; reset keeps them.
+        assert!(model.file.is_some());
+    }
+
+    #[test]
+    fn reset_settings_is_undoable() {
+        let mut model = Model::new();
+        model.params.width = 96;
+        model.commit_history();
+
+        model.reset_settings();
+        model.commit_history();
+        assert!(model.can_undo());
+
+        model.undo();
+        assert_eq!(model.params.width, 96);
+        assert!(model.can_redo());
     }
 }

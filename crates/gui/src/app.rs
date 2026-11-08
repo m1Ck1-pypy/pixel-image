@@ -344,6 +344,21 @@ impl App {
         self.request_redraw();
     }
 
+    /// "СБРОС": return the editable settings to their default values.
+    ///
+    /// The change goes through the regular undo history (recorded by the frame
+    /// after this event), so Ctrl+Z brings the previous values back.
+    fn reset_settings(&mut self) {
+        self.model.commit_edit();
+        self.model.reset_settings();
+        self.model.toast(
+            ToastTone::Info,
+            "НАСТРОЙКИ СБРОШЕНЫ К ЗНАЧЕНИЯМ ПО УМОЛЧАНИЮ",
+        );
+        self.update_title();
+        self.request_redraw();
+    }
+
     fn request_redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -824,6 +839,7 @@ impl App {
             FocusId::PickCornerColor => self.pick_corner_color(),
             FocusId::Undo => self.undo(),
             FocusId::Redo => self.redo(),
+            FocusId::ResetSettings => self.reset_settings(),
             FocusId::ZoomIn => self.zoom_in(),
             FocusId::ZoomOut => self.zoom_out(),
             FocusId::ZoomFit => self.zoom_fit(),
@@ -899,6 +915,7 @@ impl App {
             Action::CancelExport => self.cancel_export(),
             Action::Undo => self.undo(),
             Action::Redo => self.redo(),
+            Action::ResetSettings => self.reset_settings(),
             Action::PickOutputDir => self.pick_output_dir(),
             Action::PickCornerColor => self.pick_corner_color(),
             Action::ConfirmModal | Action::CancelModal => {}

@@ -840,6 +840,39 @@ pub fn chip(
     enabled && ui.clicked(rect)
 }
 
+/// Icon-only [`chip`] used by dense header rows (undo/redo/reset).
+///
+/// Same frame and hit box as a chip, with a 16x16 bitmap in place of the
+/// label; the caller owns the tooltip that names the action.
+pub fn icon_chip(
+    canvas: &mut Canvas,
+    rect: Rect,
+    icon: &icons::Bitmap,
+    enabled: bool,
+    ui: &mut UiState,
+) -> bool {
+    if rect.w <= 0 || rect.h <= 0 {
+        return false;
+    }
+    let hovered = enabled && ui.hovered(rect);
+    let fill = if !enabled {
+        theme::DISABLED
+    } else if hovered {
+        theme::PANEL_HOVER
+    } else {
+        theme::WHITE
+    };
+    canvas.fill_rect(rect.x, rect.y, rect.w, rect.h, fill);
+    canvas.stroke_rect(rect.x, rect.y, rect.w, rect.h, theme::BORDER);
+    let ink = if enabled {
+        theme::TEXT
+    } else {
+        theme::DISABLED_TEXT
+    };
+    icons::glyph(canvas, rect, 1, ink, icon);
+    enabled && ui.clicked(rect)
+}
+
 /// Static chip that only displays a value (current zoom percentage).
 pub fn badge(canvas: &mut Canvas, font: &Font, rect: Rect, label: &str, text_scale: i32) {
     if rect.w <= 0 || rect.h <= 0 {

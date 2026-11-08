@@ -50,6 +50,8 @@ pub enum Action {
     CancelExport,
     Undo,
     Redo,
+    /// Settings header icon: restores the panel to the default values.
+    ResetSettings,
     PickOutputDir,
     PickCornerColor,
     ConfirmModal,
@@ -605,42 +607,42 @@ fn draw_sidebar(
     let mut y = rect.y + 12;
     widgets::section_title(canvas, font, x, y, inner_w, "НАСТРОЙКИ", metrics.body);
 
-    // Undo/redo stay above the scrolling list so they are always reachable.
+    // The header row stays above the scrolling list: "СБРОСИТЬ" follows the
+    // caption, undo/redo are pinned to the right edge so they are always
+    // reachable. All three are icon-only chips with tooltips and shortcuts.
     let mut action = Action::None;
     let history_h = 20;
-    let history_y = rect.y + 12;
-    let undo_label = "ОТМЕНА";
-    let redo_label = "ПОВТОР";
-    let undo_w = (font.width(undo_label, metrics.small) + 16).max(56);
-    let redo_w = (font.width(redo_label, metrics.small) + 16).max(56);
-    let redo_rect = Rect::new(rect.right() - pad - redo_w, history_y, redo_w, history_h);
-    let undo_rect = Rect::new(redo_rect.x - 4 - undo_w, history_y, undo_w, history_h);
-    if widgets::chip(
-        canvas,
-        font,
-        undo_rect,
-        undo_label,
-        false,
-        model.can_undo(),
+    let history_y = rect.y + 12 + (Font::glyph_height(metrics.body) - history_h) / 2;
+    let caption_right = x + font.width("НАСТРОЙКИ", metrics.body);
+    let reset_rect = Rect::new(caption_right + 10, history_y, history_h, history_h);
+    if widgets::icon_chip(canvas, reset_rect, &icons::RESET, true, ui) {
+        action = Action::ResetSettings;
+    }
+    if focused(model, FocusId::ResetSettings) {
+        widgets::focus_ring(canvas, reset_rect);
+    }
+    hover_tip(
         ui,
-        metrics.small,
-    ) {
+        tip,
+        reset_rect,
+        "СБРОСИТЬ НАСТРОЙКИ К ЗНАЧЕНИЯМ ПО УМОЛЧАНИЮ",
+    );
+
+    let redo_rect = Rect::new(
+        rect.right() - pad - history_h,
+        history_y,
+        history_h,
+        history_h,
+    );
+    let undo_rect = Rect::new(redo_rect.x - 4 - history_h, history_y, history_h, history_h);
+    if widgets::icon_chip(canvas, undo_rect, &icons::UNDO, model.can_undo(), ui) {
         action = Action::Undo;
     }
     if focused(model, FocusId::Undo) {
         widgets::focus_ring(canvas, undo_rect);
     }
     hover_tip(ui, tip, undo_rect, "ОТМЕНИТЬ ИЗМЕНЕНИЕ (CTRL+Z)");
-    if widgets::chip(
-        canvas,
-        font,
-        redo_rect,
-        redo_label,
-        false,
-        model.can_redo(),
-        ui,
-        metrics.small,
-    ) {
+    if widgets::icon_chip(canvas, redo_rect, &icons::REDO, model.can_redo(), ui) {
         action = Action::Redo;
     }
     if focused(model, FocusId::Redo) {
@@ -1106,6 +1108,7 @@ pub fn focus_order(model: &Model) -> Vec<FocusId> {
         order.push(FocusId::Save);
         order.push(FocusId::Export);
     }
+    order.push(FocusId::ResetSettings);
     if model.can_undo() {
         order.push(FocusId::Undo);
     }
