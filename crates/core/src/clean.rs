@@ -201,6 +201,7 @@ pub fn remove_background(
 ///
 /// Заливка scanline: стек хранит только затравки строк (порядка `O(w)`), а не
 /// каждый пиксель, поэтому на 24 Мп стек не растёт до размера изображения.
+#[allow(clippy::too_many_arguments)]
 pub fn remove_background_in(
     rgba: &mut [u8],
     w: usize,
@@ -366,7 +367,7 @@ pub fn remove_background_in(
     }
 
     let mut removed = 0;
-    for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+    for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         if gone.get(i) {
             if px[3] != 0 {
                 removed += 1;
@@ -401,6 +402,7 @@ pub fn remove_thin_pockets(
 ///
 /// Расстояния и глубины хранятся в `u16` (по построению не больше `reach` и
 /// `max_width`, оба малы), маски — битсетом, списки пикселей — `Vec<u32>`.
+#[allow(clippy::too_many_arguments)]
 pub fn remove_thin_pockets_in(
     rgba: &mut [u8],
     w: usize,
@@ -434,7 +436,7 @@ pub fn remove_thin_pockets_in(
     } = scratch;
 
     near.reset(n);
-    for (i, px) in rgba.chunks_exact(4).enumerate() {
+    for (i, px) in rgba.as_chunks::<4>().0.iter().enumerate() {
         if px[3] != 0 && dist_px(px, bg) <= tol {
             near.set(i);
         }
@@ -442,7 +444,7 @@ pub fn remove_thin_pockets_in(
 
     // Расстояние до прозрачности, считаем до `reach`.
     distance_to_transparent(rgba, w, h, reach16, dist, todo);
-    if !dist.iter().any(|&d| d == 0) {
+    if !dist.contains(&0) {
         return 0;
     }
 
@@ -601,7 +603,10 @@ pub fn defringe_in(
     if depth == 0 {
         return 0;
     }
-    debug_assert!(depth <= u16::MAX as u32 - 2, "depth {depth} не влезает в u16");
+    debug_assert!(
+        depth <= u16::MAX as u32 - 2,
+        "depth {depth} не влезает в u16"
+    );
     let n = w * h;
     let depth_us = depth as usize;
     let depth16 = depth as u16;
@@ -618,7 +623,7 @@ pub fn defringe_in(
 
     // 1. Расстояние (4-связность) от прозрачных пикселей; считаем до depth+1.
     distance_to_transparent(rgba, w, h, depth16 + 1, dist, todo);
-    if !dist.iter().any(|&d| d == 0) {
+    if !dist.contains(&0) {
         return 0;
     }
 
@@ -637,7 +642,7 @@ pub fn defringe_in(
     levels.resize(level_start[depth_us + 1] as usize, 0);
     level_cursor.clear();
     level_cursor.extend_from_slice(&level_start[..=depth_us]);
-    for p in 0..n {
+    for (p, _) in dist.iter().enumerate().take(n) {
         let dd = dist[p];
         if dd >= 1 && dd as usize <= depth_us {
             let l = dd as usize;
@@ -1198,17 +1203,17 @@ mod tests {
             bits.reset(len);
             let mut want = vec![false; len];
             let mut state = 0x1234_5678u32 ^ len as u32;
-            for i in 0..len {
+            for (i, wanted) in want.iter_mut().enumerate() {
                 state ^= state << 13;
                 state ^= state >> 17;
                 state ^= state << 5;
                 if state & 1 != 0 {
                     bits.set(i);
-                    want[i] = true;
+                    *wanted = true;
                 }
             }
-            for i in 0..len {
-                assert_eq!(bits.get(i), want[i], "длина {len}, бит {i}");
+            for (i, &wanted) in want.iter().enumerate() {
+                assert_eq!(bits.get(i), wanted, "длина {len}, бит {i}");
             }
             bits.reset(len);
             for i in 0..len {
@@ -1266,7 +1271,7 @@ mod tests {
                 }
             }
             let mut removed = 0;
-            for (p, px) in rgba.chunks_exact_mut(4).enumerate() {
+            for (p, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 if gone[p] {
                     if px[3] != 0 {
                         removed += 1;
@@ -1287,7 +1292,7 @@ mod tests {
                 state ^= state << 13;
                 state ^= state >> 17;
                 state ^= state << 5;
-                let bgish = state % 5 != 0;
+                let bgish = !state.is_multiple_of(5);
                 let (r, g, b) = if bgish {
                     (
                         238 + (state >> 3) % 5,
@@ -1301,7 +1306,7 @@ mod tests {
                         90 + (state >> 11) % 40,
                     )
                 };
-                let a = if state % 23 == 0 { 0 } else { 255 };
+                let a = if state.is_multiple_of(23) { 0 } else { 255 };
                 img.extend_from_slice(&[r as u8, g as u8, b as u8, a]);
             }
 

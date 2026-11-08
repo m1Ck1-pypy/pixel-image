@@ -431,10 +431,7 @@ pub fn convert_image_with_scratch(
 /// То же, что [`convert_image`], но возвращает и время по этапам.
 ///
 /// Нужно для `--verbose` в CLI: ядро само ничего не печатает.
-pub fn convert_image_timed(
-    src: &RgbaImage,
-    options: &Options,
-) -> Result<(Conversion, StageTimes)> {
+pub fn convert_image_timed(src: &RgbaImage, options: &Options) -> Result<(Conversion, StageTimes)> {
     convert_image_timed_scratch(src, options, &mut clean::Scratch::default())
 }
 
@@ -736,7 +733,7 @@ pub fn save_png(img: &RgbaImage, fill: Option<Color>, path: &Path) -> Result<()>
         let src = &pixels[y * width..(y + 1) * width];
         match (fill, channels) {
             (Some(bg), _) => {
-                for (dst, p) in row.chunks_exact_mut(3).zip(src) {
+                for (dst, p) in row.as_chunks_mut::<3>().0.iter_mut().zip(src) {
                     let a = p[3] as u32;
                     for c in 0..3 {
                         dst[c] = ((p[c] as u32 * a + bg[c] as u32 * (255 - a) + 127) / 255) as u8;
@@ -744,12 +741,12 @@ pub fn save_png(img: &RgbaImage, fill: Option<Color>, path: &Path) -> Result<()>
                 }
             }
             (None, 3) => {
-                for (dst, p) in row.chunks_exact_mut(3).zip(src) {
+                for (dst, p) in row.as_chunks_mut::<3>().0.iter_mut().zip(src) {
                     dst.copy_from_slice(&p[..3]);
                 }
             }
             (None, _) => {
-                for (dst, p) in row.chunks_exact_mut(4).zip(src) {
+                for (dst, p) in row.as_chunks_mut::<4>().0.iter_mut().zip(src) {
                     dst.copy_from_slice(&p[..4]);
                 }
             }
@@ -783,9 +780,7 @@ mod tests {
     }
 
     fn read_back(path: &Path) -> RgbaImage {
-        image::open(path)
-            .expect("обратное чтение PNG")
-            .into_rgba8()
+        image::open(path).expect("обратное чтение PNG").into_rgba8()
     }
 
     #[test]
@@ -820,12 +815,8 @@ mod tests {
 
     #[test]
     fn save_png_fill_composites_over_background() {
-        let img = RgbaImage::from_raw(
-            3,
-            1,
-            vec![10, 20, 30, 128, 40, 50, 60, 0, 70, 80, 90, 255],
-        )
-        .expect("фикстура");
+        let img = RgbaImage::from_raw(3, 1, vec![10, 20, 30, 128, 40, 50, 60, 0, 70, 80, 90, 255])
+            .expect("фикстура");
         let bg: Color = [255, 255, 255];
         let path = temp_path("fill");
 
@@ -864,7 +855,12 @@ mod tests {
 
         // То же для RGBA-ветки.
         let img = RgbaImage::from_fn(3, 5, |x, y| {
-            image::Rgba([(x * 40) as u8, (y * 30) as u8, 9, if (x + y) % 2 == 0 { 0 } else { 200 }])
+            image::Rgba([
+                (x * 40) as u8,
+                (y * 30) as u8,
+                9,
+                if (x + y) % 2 == 0 { 0 } else { 200 },
+            ])
         });
         let path = temp_path("pad-rgba");
         save_png(&img, None, &path).expect("запись");
@@ -894,10 +890,8 @@ mod tests {
             ])
         });
 
-        let cases: [(&str, &RgbaImage, bool); 2] = [
-            ("opaque", &opaque, true),
-            ("alpha", &alpha, false),
-        ];
+        let cases: [(&str, &RgbaImage, bool); 2] =
+            [("opaque", &opaque, true), ("alpha", &alpha, false)];
         for (label, img, is_opaque) in cases {
             let ours = temp_path(&format!("size-{label}"));
             save_png(img, None, &ours).expect("наша запись");

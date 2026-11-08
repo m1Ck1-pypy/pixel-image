@@ -30,12 +30,12 @@ where
         .num_threads(1)
         .build()
         .expect("пул из одного потока")
-        .install(|| f());
+        .install(&f);
     let four = ThreadPoolBuilder::new()
         .num_threads(4)
         .build()
         .expect("пул из четырёх потоков")
-        .install(|| f());
+        .install(&f);
     let default = f();
     assert_eq!(one, four, "{name}: 1 поток и 4 потока дают разное");
     assert_eq!(one, default, "{name}: 1 поток и общий пул дают разное");

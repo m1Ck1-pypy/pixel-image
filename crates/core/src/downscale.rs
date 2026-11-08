@@ -89,7 +89,7 @@ fn downscale_blocks(src: &RgbaImage, gw: u32, gh: u32, mode: bool, faint: u8) ->
         let y0 = (gy as u64 * h as u64 / gh as u64) as u32;
         let y1 = (((gy as u64 + 1) * h as u64 / gh as u64) as u32).clamp(y0 + 1, h);
 
-        for (gx, cell) in cells.chunks_exact_mut(4).enumerate() {
+        for (gx, cell) in cells.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let gx = gx as u32;
             let x0 = (gx as u64 * w as u64 / gw as u64) as u32;
             let x1 = (((gx as u64 + 1) * w as u64 / gw as u64) as u32).clamp(x0 + 1, w);
@@ -174,7 +174,6 @@ fn downscale_blocks(src: &RgbaImage, gw: u32, gh: u32, mode: bool, faint: u8) ->
     RgbaImage::from_raw(gw, gh, out).expect("размер буфера")
 }
 
-
 /// Делает прозрачность бинарной: альфа >= порога -> непрозрачный, иначе прозрачный.
 pub fn apply_alpha_threshold(img: &mut RgbaImage, threshold: u8) {
     let width = img.width() as usize;
@@ -198,7 +197,6 @@ fn threshold_rows(raw: &mut [u8], threshold: u8) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,9 +209,9 @@ mod tests {
                 let edge = x < w / 4 && y < h / 4;
                 let alpha = if edge {
                     0
-                } else if (x + y + seed) % 7 == 0 {
+                } else if (x + y + seed).is_multiple_of(7) {
                     12 // слабая альфа: считается прозрачной
-                } else if (x + y + seed) % 5 == 0 {
+                } else if (x + y + seed).is_multiple_of(5) {
                     128
                 } else {
                     255
@@ -260,7 +258,11 @@ mod tests {
                 for &(gw, gh) in &targets {
                     let got = filter.downscale(&raw, gw, gh, crate::pipeline::FAINT_ALPHA);
                     let want = filter.downscale(&cut, gw, gh, 0);
-                    assert_eq!(got.dimensions(), want.dimensions(), "{w}x{h} -> {gw}x{gh}, {filter:?}");
+                    assert_eq!(
+                        got.dimensions(),
+                        want.dimensions(),
+                        "{w}x{h} -> {gw}x{gh}, {filter:?}"
+                    );
                     assert_eq!(
                         got.as_raw(),
                         want.as_raw(),
@@ -289,12 +291,8 @@ mod tests {
 
     #[test]
     fn alpha_threshold_zeroes_low_alpha() {
-        let mut img = RgbaImage::from_raw(
-            2,
-            1,
-            vec![10, 20, 30, 100, 40, 50, 60, 200],
-        )
-        .expect("фикстура");
+        let mut img =
+            RgbaImage::from_raw(2, 1, vec![10, 20, 30, 100, 40, 50, 60, 200]).expect("фикстура");
         apply_alpha_threshold(&mut img, 128);
         assert_eq!(img.get_pixel(0, 0).0, [0, 0, 0, 0]);
         assert_eq!(img.get_pixel(1, 0).0, [40, 50, 60, 255]);

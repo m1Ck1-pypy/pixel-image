@@ -254,7 +254,12 @@ pub fn resize_premultiplied(
         for (i, &wy) in yw.iter().enumerate() {
             let start = (yl + i) * w_us * 4;
             let src_row = &raw[start..start + w_us * 4];
-            for (v, p) in vrow.chunks_exact_mut(4).zip(src_row.as_chunks::<4>().0) {
+            for (v, p) in vrow
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(src_row.as_chunks::<4>().0)
+            {
                 let a = clean_alpha(p[3], faint) as u32;
                 v[0] += premultiply(p[0], a) as f32 * wy;
                 v[1] += premultiply(p[1], a) as f32 * wy;
@@ -263,7 +268,7 @@ pub fn resize_premultiplied(
             }
         }
 
-        for (ox, px) in dst.chunks_exact_mut(4).enumerate() {
+        for (ox, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let (xl, xw) = x.entry(ox);
             let mut t = [0f32; 4];
             for (j, &wx) in xw.iter().enumerate() {
@@ -305,7 +310,12 @@ pub fn resize_premultiplied(
 /// разделить», поэтому повторяем именно его, а не голую копию.
 fn same_size(raw: &[u8], w: u32, h: u32, faint: u8) -> RgbaImage {
     let mut out = vec![0u8; raw.len()];
-    for (dst, p) in out.chunks_exact_mut(4).zip(raw.as_chunks::<4>().0) {
+    for (dst, p) in out
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(raw.as_chunks::<4>().0)
+    {
         let a = clean_alpha(p[3], faint);
         let a32 = a as u32;
         dst[0] = unpremultiply(premultiply(p[0], a32), a32);
@@ -543,7 +553,11 @@ mod tests {
             };
             assert_eq!(serial.as_raw(), under(1).as_raw(), "{kernel:?}: 1 поток");
             assert_eq!(serial.as_raw(), under(4).as_raw(), "{kernel:?}: 4 потока");
-            assert_eq!(serial.as_raw(), under(16).as_raw(), "{kernel:?}: 16 потоков");
+            assert_eq!(
+                serial.as_raw(),
+                under(16).as_raw(),
+                "{kernel:?}: 16 потоков"
+            );
         }
     }
 

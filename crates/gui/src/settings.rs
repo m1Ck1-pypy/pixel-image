@@ -610,6 +610,9 @@ fn valid_prefix(prefix: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Изменение настроек в тесте отпечатка: подпись и мутатор модели.
+    type Change = (&'static str, fn(&mut Model));
+
     #[test]
     fn older_document_without_maximized_still_loads() {
         let document = r#"{"version":1,"window":{"width":1280,"height":800}}"#;
@@ -662,7 +665,7 @@ mod tests {
             "размер окна входит в отпечаток"
         );
 
-        let changes: [(&str, fn(&mut Model)); 6] = [
+        let changes: [Change; 6] = [
             ("ширина сетки", |m| m.params.width += 1),
             ("число цветов", |m| m.params.colors += 1),
             ("ячейка", |m| m.params.cell += 1),
